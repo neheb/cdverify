@@ -1,0 +1,24 @@
+[package]
+name = "accuraterip-tui"
+version = "0.1.0"
+edition = "2024"
+authors = ["Rosen Penev"]
+description = "Verify CD rips against AccurateRip and CTDB, and repair them with CTDB parity data"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/neheb/accuraterip-tui"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+flacenc = { version = "0.5.1", default-features = false }
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.152"
+sha1 = "0.11.0"
+symphonia = { version = "0.6.1", default-features = false, features = ["flac", "wav", "aiff", "alac", "isomp4", "pcm"] }
+ureq = { version = "3.4.2", default-features = false, features = ["gzip"] }
+walkdir = "2.5.0"
+
+[profile.release]
+strip = true

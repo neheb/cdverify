@@ -1,0 +1,299 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+mod app;
+mod cache;
+mod crc;
+mod db;
+mod decode;
+mod disc;
+mod flacout;
+mod parity;
+mod repair;
+mod report;
+mod scan;
+mod ui;
+mod verify;
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use anyhow::Result;
+use clap::Parser;
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, KeyEventKind};
+use ratatui::crossterm::execute;
+
+use app::{App, Event};
+use cache::Cache;
+use db::Db;
+use verify::Options;
+
+/// Checks a music library's lossless CD rips against the AccurateRip database.
+#[derive(Parser, Debug)]
+#[command(version)]
+struct Cli {
+    /// Library folder to scan.
+    dir: PathBuf,
+    /// Minimum AccurateRip confidence for a track to count as accurate.
+    /// Use 2 if you have submitted your own rips to AccurateRip.
+    #[arg(long, default_value_t = 1)]
+    min_confidence: u32,
+    /// Ignore dBpoweramp ACCURATERIPRESULT tags and always decode.
+    #[arg(long)]
+    no_tag: bool,
+    /// Worker threads (default: number of CPUs).
+    #[arg(long)]
+    threads: Option<usize>,
+    /// Pressing offset search range in samples (0 disables the search).
+    #[arg(long, default_value_t = crc::MAX_OFFSET, value_parser = clap::value_parser!(i64).range(0..=crc::MAX_OFFSET))]
+    offset_range: i64,
+    /// Don't list albums that aren't lossless 44.1 kHz/16-bit audio.
+    #[arg(long)]
+    skip_non_cd: bool,
+    /// Report path (JSON; a .txt summary is written alongside). Written on `e`,
+    /// or automatically when finished in --headless mode.
+    #[arg(long, default_value = "accuraterip-report.json")]
+    report: PathBuf,
+    /// No TUI: print one line per album and write the report when done.
+    #[arg(long)]
+    headless: bool,
+    /// Don't ask the CUETools database (CTDB) for the data track of Enhanced
+    /// CDs that AccurateRip doesn't know by their audio tracks alone.
+    #[arg(long)]
+    no_ctdb: bool,
+    /// Repair albums with ripping errors using CTDB's repair data, writing
+    /// corrected copies of the damaged tracks under this folder (mirroring
+    /// the library layout). The library itself is never modified.
+    #[arg(long, value_name = "DIR")]
+    repair: Option<PathBuf>,
+    /// Check every album against CTDB's parity data (no writing).
+    #[arg(long, hide = true)]
+    ctdb_check: bool,
+    /// Re-verify every folder, ignoring cached results (the cache is still updated).
+    #[arg(long)]
+    rescan: bool,
+    /// Results cache file [default: ~/.cache/accuraterip-tui/cache.json].
+    #[arg(long)]
+    cache: Option<PathBuf>,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let opts = Options {
+        min_confidence: cli.min_confidence,
+        use_tags: !cli.no_tag,
+        offset_range: cli.offset_range,
+        max_candidates: 4,
+        use_ctdb: !cli.no_ctdb,
+    };
+    let threads = cli
+        .threads
+        .unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()))
+        .max(1);
+
+    let cache_path = cli.cache.clone().unwrap_or_else(cache::default_path);
+    let cache = Cache::load(&cache_path);
+    let prior = (!cli.rescan).then(|| Arc::new(cache.clone()));
+
+    let repair_opts = RepairOptions {
+        out: cli.repair.clone(),
+        check_all: cli.ctdb_check,
+    };
+    let (tx, rx) = mpsc::channel();
+    // Canonicalize so cache keys don't depend on how the path was typed.
+    let root = std::fs::canonicalize(&cli.dir).unwrap_or_else(|_| cli.dir.clone());
+    let db = Arc::new(Db::new());
+    let repairer = app::Repairer {
+        tx: tx.clone(),
+        db: db.clone(),
+        root: root.clone(),
+        out: cli.repair.clone().unwrap_or_else(repair::default_out),
+    };
+    start(root, threads, opts, prior, repair_opts, db, tx);
+
+    let mut app = App::new(cli.report.clone(), cli.skip_non_cd, cache, cache_path);
+    app.repairer = Some(repairer);
+    if cli.headless {
+        run_headless(&mut app, rx)
+    } else {
+        let mut terminal = ratatui::init();
+        execute!(std::io::stdout(), EnableMouseCapture)?;
+        let result = run_tui(&mut terminal, &mut app, rx);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        ratatui::restore();
+        app.save_cache();
+        result
+    }
+}
+
+/// Scans `root` and processes folders on `threads` worker threads.
+#[derive(Clone)]
+struct RepairOptions {
+    out: Option<PathBuf>,
+    check_all: bool,
+}
+
+/// Checks albums with ripping errors against CTDB's parity data (every
+/// album with `check_all`), writing repaired copies when `--repair` is given.
+fn maybe_repair(
+    album: &mut verify::AlbumResult,
+    job: &scan::AlbumJob,
+    root: &std::path::Path,
+    db: &Db,
+    ro: &RepairOptions,
+    progress: &mut dyn FnMut(f32),
+) {
+    let wants = ro.check_all
+        || (album.verdict == verify::Verdict::RipErrors
+            && album.ctdb_known
+            && album.diagnosis.is_none());
+    let Some(toc) = album.ctdb_toc.clone() else {
+        return;
+    };
+    if wants {
+        let dest = ro
+            .out
+            .as_ref()
+            .map(|o| repair::destination(o, root, &job.dir));
+        let (outcome, msg) = repair::run(job, &toc, db, dest.as_deref(), progress);
+        if album.verdict == verify::Verdict::RipErrors {
+            album.reason = format!("{}; {}", album.reason, outcome.verdict_note());
+        }
+        // An exact CTDB match is a final answer (until --rescan), like an
+        // accurate rip; everything else is worth rechecking next run.
+        if outcome == repair::Outcome::Verified {
+            album.recheck = false;
+        }
+        album.repair_outcome = Some(outcome);
+        album.repair = Some(msg);
+    }
+}
+
+fn start(
+    root: PathBuf,
+    threads: usize,
+    opts: Options,
+    prior: Option<Arc<Cache>>,
+    ro: RepairOptions,
+    db: Arc<Db>,
+    tx: Sender<Event>,
+) {
+    thread::spawn(move || {
+        let folders = scan::find_folders(&root);
+        let _ = tx.send(Event::Total(folders.len()));
+        let queue = Arc::new(Mutex::new(VecDeque::from(folders)));
+        for worker in 0..threads {
+            let (queue, db, opts, tx) = (queue.clone(), db.clone(), opts.clone(), tx.clone());
+            let prior = prior.clone();
+            let ro = ro.clone();
+            let root = root.clone();
+            thread::spawn(move || {
+                loop {
+                    let Some((dir, files)) = queue.lock().unwrap().pop_front() else {
+                        break;
+                    };
+                    let stamps = cache::stamps(&files);
+                    let hit = prior
+                        .as_ref()
+                        .zip(stamps.as_ref())
+                        .and_then(|(c, s)| c.get(&dir, s))
+                        .filter(|albums| verify::cached_valid(albums, &opts));
+                    if let Some(albums) = hit {
+                        let _ = tx.send(Event::Done {
+                            worker,
+                            dir,
+                            stamps,
+                            from_cache: true,
+                            albums,
+                        });
+                        continue;
+                    }
+                    let label = dir
+                        .strip_prefix(&root)
+                        .unwrap_or(&dir)
+                        .display()
+                        .to_string();
+                    let _ = tx.send(Event::Started { worker, label });
+                    let tracks = files.iter().map(|f| scan::probe_track(f)).collect();
+                    let jobs = scan::group(&dir, tracks);
+                    let n = jobs.len() as f32;
+                    let albums = jobs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, job)| {
+                            let mut progress = |frac: f32| {
+                                let _ = tx.send(Event::Progress {
+                                    worker,
+                                    frac: (i as f32 + frac) / n,
+                                });
+                            };
+                            let mut album = verify::verify(job, &db, &opts, &mut progress);
+                            maybe_repair(&mut album, job, &root, &db, &ro, &mut progress);
+                            album
+                        })
+                        .collect();
+                    let _ = tx.send(Event::Done {
+                        worker,
+                        dir,
+                        stamps,
+                        from_cache: false,
+                        albums,
+                    });
+                }
+            });
+        }
+    });
+}
+
+fn run_tui(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    rx: Receiver<Event>,
+) -> Result<()> {
+    loop {
+        // Progress events arrive per decoded packet; coalesce them per frame.
+        while let Ok(ev) = rx.try_recv() {
+            app.handle(ev);
+        }
+        terminal.draw(|f| ui::draw(f, app))?;
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                event::Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if app.key(key) {
+                        return Ok(());
+                    }
+                }
+                event::Event::Mouse(m) => app.mouse(m),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn run_headless(app: &mut App, rx: Receiver<Event>) -> Result<()> {
+    while !app.finished() {
+        let Ok(ev) = rx.recv() else { break };
+        if let Event::Done { albums, .. } = &ev {
+            for a in albums {
+                println!("{:<18} {}  [{}]", a.verdict.label(), a.title, a.reason);
+                if let Some(r) = &a.repair {
+                    println!("{:<18} {r}", "");
+                }
+            }
+        }
+        app.handle(ev);
+    }
+    app.save_cache();
+    let (json, txt) = report::write(&app.report_path, &app.albums)?;
+    eprintln!(
+        "{} of {} folders from cache ({})",
+        app.cached,
+        app.done,
+        app.cache_path.display()
+    );
+    eprintln!("Report written to {} and {}", json.display(), txt.display());
+    Ok(())
+}

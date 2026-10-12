@@ -116,7 +116,9 @@ fn draw_progress(f: &mut Frame<'_>, app: &App, area: Rect) {
         Gauge::default()
             .gauge_style(Color::Cyan)
             .ratio(ratio)
-            .label(label),
+            // Gauge always centres its label; padding it to the full width
+            // pins the text to the left edge.
+            .label(format!("{label:<w$}", w = rows[0].width as usize)),
         rows[0],
     );
     for ((name, frac), row) in app.active.values().zip(rows.iter().skip(1)) {

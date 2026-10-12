@@ -4,7 +4,8 @@
 //!
 //! A folder's results are reused when its audio files are unchanged (same
 //! names, sizes and modification times). Only final results are stored; see
-//! [`AlbumResult::recheck`].
+//! [`AlbumResult::recheck`]. `--invert` runs keep their own entries, so
+//! switching modes doesn't throw away the other mode's results.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,12 @@ pub struct Entry {
 pub struct Cache {
     version: u32,
     folders: HashMap<PathBuf, Entry>,
+    /// Results of `--invert` runs.
+    #[serde(default)]
+    inverted: HashMap<PathBuf, Entry>,
+    /// Which of the two this run uses.
+    #[serde(skip)]
+    ctdb_first: bool,
 }
 
 /// Stats `files`; `None` if any of them can't be read.
@@ -64,15 +71,32 @@ pub fn default_path() -> PathBuf {
 
 impl Cache {
     /// Loads the cache, starting empty if it is missing or unreadable.
-    pub fn load(path: &Path) -> Cache {
-        std::fs::read(path)
+    /// `ctdb_first` picks the `--invert` entries.
+    pub fn load(path: &Path, ctdb_first: bool) -> Cache {
+        let mut c = std::fs::read(path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Cache>(&b).ok())
             .filter(|c| c.version == VERSION)
             .unwrap_or_else(|| Cache {
                 version: VERSION,
-                folders: HashMap::new(),
-            })
+                ..Cache::default()
+            });
+        c.ctdb_first = ctdb_first;
+        c
+    }
+
+    fn entries(&self) -> &HashMap<PathBuf, Entry> {
+        match self.ctdb_first {
+            true => &self.inverted,
+            false => &self.folders,
+        }
+    }
+
+    fn entries_mut(&mut self) -> &mut HashMap<PathBuf, Entry> {
+        match self.ctdb_first {
+            true => &mut self.inverted,
+            false => &mut self.folders,
+        }
     }
 
     /// Writes atomically (temporary file + rename).
@@ -88,7 +112,7 @@ impl Cache {
 
     /// Cached results for `dir` if its files still match `files`.
     pub fn get(&self, dir: &Path, files: &[FileStamp]) -> Option<Vec<AlbumResult>> {
-        let e = self.folders.get(dir)?;
+        let e = self.entries().get(dir)?;
         (e.files == files).then(|| {
             let mut albums = e.albums.clone();
             for a in &mut albums {
@@ -102,7 +126,7 @@ impl Cache {
     pub fn update(&mut self, dir: PathBuf, files: Option<Vec<FileStamp>>, albums: &[AlbumResult]) {
         match files {
             Some(files) if !albums.iter().any(|a| a.recheck) => {
-                self.folders.insert(
+                self.entries_mut().insert(
                     dir,
                     Entry {
                         files,
@@ -111,7 +135,7 @@ impl Cache {
                 );
             }
             _ => {
-                self.folders.remove(&dir);
+                self.entries_mut().remove(&dir);
             }
         }
     }
@@ -178,11 +202,19 @@ mod tests {
     fn save_and_load_round_trip() {
         let dir = std::env::temp_dir().join(format!("artui-cache-test-{}", std::process::id()));
         let path = dir.join("cache.json");
-        let mut c = Cache::load(&path);
+        let mut c = Cache::load(&path, false);
         c.update("/a".into(), Some(vec![stamp(10)]), &[album(false)]);
         c.save(&path).unwrap();
-        let loaded = Cache::load(&path);
+        let mut inv = Cache::load(&path, true);
+        assert!(inv.get(Path::new("/a"), &[stamp(10)]).is_none());
+        inv.update("/b".into(), Some(vec![stamp(10)]), &[album(false)]);
+        inv.save(&path).unwrap();
+        // Each mode keeps its own entries.
+        let loaded = Cache::load(&path, false);
         assert!(loaded.get(Path::new("/a"), &[stamp(10)]).is_some());
+        assert!(loaded.get(Path::new("/b"), &[stamp(10)]).is_none());
+        let loaded = Cache::load(&path, true);
+        assert!(loaded.get(Path::new("/b"), &[stamp(10)]).is_some());
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }

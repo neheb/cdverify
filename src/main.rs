@@ -100,7 +100,7 @@ fn main() -> Result<()> {
         .max(1);
 
     let cache_path = cli.cache.clone().unwrap_or_else(cache::default_path);
-    let cache = Cache::load(&cache_path);
+    let cache = Cache::load(&cache_path, cli.invert);
     let prior = (!cli.rescan).then(|| Arc::new(cache.clone()));
 
     let repair_opts = RepairOptions {

@@ -524,7 +524,8 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
 /// `--invert`: checks the album against CTDB's parity data and asks
 /// AccurateRip only about albums that don't match it, reusing `ar` (a
 /// [`verify`] result) if given. `dest` is where repaired copies go
-/// (`--repair`).
+/// (`--repair`). Also returns the CTDB check's outcome and description, if
+/// it ran.
 pub fn verify_ctdb_first(
     job: &AlbumJob,
     db: &Db,
@@ -532,12 +533,12 @@ pub fn verify_ctdb_first(
     dest: Option<&Path>,
     ar: Option<&AlbumResult>,
     progress: Progress<'_>,
-) -> AlbumResult {
+) -> (AlbumResult, Option<(Outcome, String)>) {
     let mut result = blank_result(job);
     result.ctdb_first = true;
     if let Err(reason) = check_eligible(job) {
         result.reason = reason;
-        return result;
+        return (result, None);
     }
     let sectors = identify(job, &mut result);
     let offsets = disc::audio_offsets(&sectors);
@@ -547,17 +548,21 @@ pub fn verify_ctdb_first(
         Ok(None) => {
             result.reason = "Not in CTDB".into();
             result.recheck = true;
-            return result;
+            return (result, None);
         }
         Err(e) => {
             result.reason = format!("CTDB lookup failed: {e}");
             result.recheck = true;
-            return result;
+            return (result, None);
         }
     };
     let toc = db::ctdb_toc(&offsets, audio_end, layout);
-    let (outcome, msg) = repair::run(job, &toc, db, dest, progress);
-    if outcome != Outcome::Verified {
+    let analysis = repair::analyze(job, &toc, db, progress);
+    let Some((confidence, offset)) = analysis.as_ref().ok().and_then(|a| a.verified()) else {
+        let (outcome, msg) = match &analysis {
+            Ok(a) => repair::finish(job, a, dest),
+            Err(e) => repair::failed(e),
+        };
         // Not a clean CTDB match: let AccurateRip have its say.
         let mut ar = match ar {
             Some(a) => a.clone(),
@@ -567,7 +572,7 @@ pub fn verify_ctdb_first(
         ar.ctdb_known = outcome != Outcome::Failed;
         ar.ctdb_toc = Some(toc);
         ar.repair_outcome = Some(outcome);
-        ar.repair = Some(msg);
+        ar.repair = Some(msg.clone());
         match ar.verdict {
             Verdict::Accurate => ar.reason.push_str("; differs from CTDB"),
             Verdict::RipErrors => {
@@ -585,8 +590,8 @@ pub fn verify_ctdb_first(
                 ar.recheck = true;
             }
         }
-        return ar;
-    }
+        return (ar, Some((outcome, msg)));
+    };
 
     if let Some(layout) = layout {
         let (id, note) = layout_id(&sectors, layout);
@@ -601,12 +606,12 @@ pub fn verify_ctdb_first(
         t.status = TrackStatus::AccurateCtdb;
     }
     result.verdict = Verdict::Accurate;
-    result.reason = "Accurate (matches CTDB)".into();
+    result.reason = format!("Accurate (matches CTDB, confidence {confidence}, offset {offset:+})");
     result.ctdb_known = true;
     result.ctdb_toc = Some(toc);
-    result.repair_outcome = Some(outcome);
-    result.repair = Some(msg);
-    result
+    result.repair_outcome = Some(Outcome::Verified);
+    let msg = analysis.map(|a| a.summary()).unwrap_or_default();
+    (result, Some((Outcome::Verified, msg)))
 }
 
 /// The layout under which CTDB knows this disc (`None` for audio only),

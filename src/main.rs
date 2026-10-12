@@ -204,22 +204,19 @@ fn check_album(
         .map(|o| repair::destination(o, root, &job.dir));
     if !both {
         let mut album = match opts.ctdb_first {
-            true => verify::verify_ctdb_first(job, db, opts, dest.as_deref(), None, progress),
+            true => verify::verify_ctdb_first(job, db, opts, dest.as_deref(), None, progress).0,
             false => verify::verify(job, db, opts, progress),
         };
         maybe_repair(&mut album, job, root, db, ro, None, progress);
         return (album, None);
     }
     let mut normal = verify::verify(job, db, opts, &mut |f| progress(f / 2.0));
-    let inverted =
+    let (inverted, checked) =
         verify::verify_ctdb_first(job, db, opts, dest.as_deref(), Some(&normal), &mut |f| {
             progress(0.5 + f / 2.0)
         });
     // Normal mode's CTDB check is the same one if it's for the same TOC.
-    let known = inverted
-        .repair_outcome
-        .zip(inverted.repair.clone())
-        .filter(|_| inverted.ctdb_toc == normal.ctdb_toc);
+    let known = checked.filter(|_| inverted.ctdb_toc == normal.ctdb_toc);
     maybe_repair(&mut normal, job, root, db, ro, known, progress);
     match opts.ctdb_first {
         true => (inverted, Some(normal)),

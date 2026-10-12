@@ -127,6 +127,14 @@ impl Analysis {
         }
     }
 
+    /// Confidence and offset of the CTDB entry the rip matches exactly.
+    pub fn verified(&self) -> Option<(u32, i64)> {
+        self.statuses.iter().find_map(|s| match s {
+            EntryStatus::Verified { confidence, offset } => Some((*confidence, *offset)),
+            _ => None,
+        })
+    }
+
     pub fn repairable(&self) -> bool {
         self.plan.is_some()
     }
@@ -347,14 +355,23 @@ pub fn run(
     dest: Option<&Path>,
     progress: &mut dyn FnMut(f32),
 ) -> (Outcome, String) {
-    let analysis = match analyze(job, toc, db, progress) {
-        Ok(a) => a,
-        Err(e) => return (Outcome::Failed, format!("Repair check failed: {e:#}")),
-    };
+    match analyze(job, toc, db, progress) {
+        Ok(a) => finish(job, &a, dest),
+        Err(e) => failed(&e),
+    }
+}
+
+/// The outcome of an [`analyze`] that failed.
+pub fn failed(e: &anyhow::Error) -> (Outcome, String) {
+    (Outcome::Failed, format!("Repair check failed: {e:#}"))
+}
+
+/// The second half of [`run`]: writes repaired copies to `dest` if possible.
+pub fn finish(job: &AlbumJob, analysis: &Analysis, dest: Option<&Path>) -> (Outcome, String) {
     let summary = analysis.summary();
     match (dest, analysis.outcome()) {
         (Some(dest), Outcome::Repairable) => {
-            match write_repaired(job, &analysis, dest, &mut |_| {}) {
+            match write_repaired(job, analysis, dest, &mut |_| {}) {
                 Ok((files, encoder)) => (
                     Outcome::Repaired,
                     format!(

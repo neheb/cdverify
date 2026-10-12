@@ -112,31 +112,71 @@ impl Cache {
 
     /// Cached results for `dir` if its files still match `files`.
     pub fn get(&self, dir: &Path, files: &[FileStamp]) -> Option<Vec<AlbumResult>> {
-        let e = self.entries().get(dir)?;
-        (e.files == files).then(|| {
-            let mut albums = e.albums.clone();
-            for a in &mut albums {
-                a.cached = true;
-            }
-            albums
-        })
+        get(self.entries(), dir, files)
+    }
+
+    /// Like [`Cache::get`], for the other mode (`--both`).
+    pub fn get_other(&self, dir: &Path, files: &[FileStamp]) -> Option<Vec<AlbumResult>> {
+        let other = match self.ctdb_first {
+            true => &self.folders,
+            false => &self.inverted,
+        };
+        get(other, dir, files)
     }
 
     /// Records a folder's results, or forgets it if any album needs rechecking.
     pub fn update(&mut self, dir: PathBuf, files: Option<Vec<FileStamp>>, albums: &[AlbumResult]) {
-        match files {
-            Some(files) if !albums.iter().any(|a| a.recheck) => {
-                self.entries_mut().insert(
-                    dir,
-                    Entry {
-                        files,
-                        albums: albums.to_vec(),
-                    },
-                );
-            }
-            _ => {
-                self.entries_mut().remove(&dir);
-            }
+        update(self.entries_mut(), dir, files, albums);
+    }
+
+    /// Like [`Cache::update`], for the other mode (`--both`).
+    pub fn update_other(
+        &mut self,
+        dir: PathBuf,
+        files: Option<Vec<FileStamp>>,
+        albums: &[AlbumResult],
+    ) {
+        let other = match self.ctdb_first {
+            true => &mut self.folders,
+            false => &mut self.inverted,
+        };
+        update(other, dir, files, albums);
+    }
+}
+
+fn get(
+    entries: &HashMap<PathBuf, Entry>,
+    dir: &Path,
+    files: &[FileStamp],
+) -> Option<Vec<AlbumResult>> {
+    let e = entries.get(dir)?;
+    (e.files == files).then(|| {
+        let mut albums = e.albums.clone();
+        for a in &mut albums {
+            a.cached = true;
+        }
+        albums
+    })
+}
+
+fn update(
+    entries: &mut HashMap<PathBuf, Entry>,
+    dir: PathBuf,
+    files: Option<Vec<FileStamp>>,
+    albums: &[AlbumResult],
+) {
+    match files {
+        Some(files) if !albums.iter().any(|a| a.recheck) => {
+            entries.insert(
+                dir,
+                Entry {
+                    files,
+                    albums: albums.to_vec(),
+                },
+            );
+        }
+        _ => {
+            entries.remove(&dir);
         }
     }
 }

@@ -40,6 +40,8 @@ pub enum Event {
         stamps: Option<Vec<FileStamp>>,
         from_cache: bool,
         albums: Vec<AlbumResult>,
+        /// With `--both`: the other mode's results, for the cache.
+        other: Option<Vec<AlbumResult>>,
     },
 }
 
@@ -153,12 +155,16 @@ impl App {
                 stamps,
                 from_cache,
                 albums,
+                other,
             } => {
                 self.active.remove(&worker);
                 self.done += 1;
                 if from_cache {
                     self.cached += 1;
                 } else {
+                    if let Some(other) = other {
+                        self.cache.update_other(dir.clone(), stamps.clone(), &other);
+                    }
                     self.cache.update(dir, stamps, &albums);
                     self.cache_dirty = true;
                 }

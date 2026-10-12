@@ -63,7 +63,7 @@ Options:
 - `--no-ctdb`: don't contact the CUETools database (no layout lookups or repair-data checks).
 - `--invert`: use CTDB as the primary source. Albums whose audio matches a CTDB entry exactly are accurate; only the rest are checked against AccurateRip, and those that match neither land in Ripping Errors (with CTDB's repair verdict). Albums CTDB doesn't know go to Cannot Check.
 - `--rescan`: re-verify every folder and ignore cached results (the cache is still updated).
-- `--cache PATH`: results cache location (default `~/.cache/accuraterip-tui/cache.json`).
+- `--cache PATH`: results cache location (default `~/.cache/accuraterip-tui/cache.json`). Each run caches results for both normal and `--invert` mode (unless `--no-ctdb` is given), so switching modes doesn't re-verify. The AccurateRip and CTDB checks are shared between the two, costing at most one extra decode per album.
 
 ## How it works
 

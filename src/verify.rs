@@ -522,13 +522,15 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
 }
 
 /// `--invert`: checks the album against CTDB's parity data and asks
-/// AccurateRip only about albums that don't match it. `dest` is where
-/// repaired copies go (`--repair`).
+/// AccurateRip only about albums that don't match it, reusing `ar` (a
+/// [`verify`] result) if given. `dest` is where repaired copies go
+/// (`--repair`).
 pub fn verify_ctdb_first(
     job: &AlbumJob,
     db: &Db,
     opts: &Options,
     dest: Option<&Path>,
+    ar: Option<&AlbumResult>,
     progress: Progress<'_>,
 ) -> AlbumResult {
     let mut result = blank_result(job);
@@ -557,7 +559,10 @@ pub fn verify_ctdb_first(
     let (outcome, msg) = repair::run(job, &toc, db, dest, progress);
     if outcome != Outcome::Verified {
         // Not a clean CTDB match: let AccurateRip have its say.
-        let mut ar = verify(job, db, opts, progress);
+        let mut ar = match ar {
+            Some(a) => a.clone(),
+            None => verify(job, db, opts, progress),
+        };
         ar.ctdb_first = true;
         ar.ctdb_known = outcome != Outcome::Failed;
         ar.ctdb_toc = Some(toc);

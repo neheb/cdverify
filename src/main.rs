@@ -117,7 +117,10 @@ fn main() -> Result<()> {
         root: root.clone(),
         out: cli.repair.clone().unwrap_or_else(repair::default_out),
     };
-    start(root, threads, opts, prior, repair_opts, db, tx);
+    // Work out both modes' results (normal and --invert) so a later run in
+    // either mode comes from the cache; without CTDB there's only one.
+    let both = !cli.no_ctdb;
+    start(root, threads, opts, both, prior, repair_opts, db, tx);
 
     let mut app = App::new(cli.report.clone(), cli.skip_non_cd, cache, cache_path);
     app.repairer = Some(repairer);
@@ -149,6 +152,7 @@ fn maybe_repair(
     root: &std::path::Path,
     db: &Db,
     ro: &RepairOptions,
+    known: Option<(repair::Outcome, String)>,
     progress: &mut dyn FnMut(f32),
 ) {
     // Already checked against CTDB (--invert).
@@ -167,7 +171,8 @@ fn maybe_repair(
             .out
             .as_ref()
             .map(|o| repair::destination(o, root, &job.dir));
-        let (outcome, msg) = repair::run(job, &toc, db, dest.as_deref(), progress);
+        let (outcome, msg) =
+            known.unwrap_or_else(|| repair::run(job, &toc, db, dest.as_deref(), progress));
         if album.verdict == verify::Verdict::RipErrors {
             album.reason = format!("{}; {}", album.reason, outcome.verdict_note());
         }
@@ -181,10 +186,53 @@ fn maybe_repair(
     }
 }
 
+/// Checks one album in this run's mode and, with `both`, in the other mode
+/// too, sharing the AccurateRip and CTDB checks between them.
+#[allow(clippy::too_many_arguments)]
+fn check_album(
+    job: &scan::AlbumJob,
+    root: &std::path::Path,
+    db: &Db,
+    opts: &Options,
+    both: bool,
+    ro: &RepairOptions,
+    progress: &mut dyn FnMut(f32),
+) -> (verify::AlbumResult, Option<verify::AlbumResult>) {
+    let dest = ro
+        .out
+        .as_ref()
+        .map(|o| repair::destination(o, root, &job.dir));
+    if !both {
+        let mut album = match opts.ctdb_first {
+            true => verify::verify_ctdb_first(job, db, opts, dest.as_deref(), None, progress),
+            false => verify::verify(job, db, opts, progress),
+        };
+        maybe_repair(&mut album, job, root, db, ro, None, progress);
+        return (album, None);
+    }
+    let mut normal = verify::verify(job, db, opts, &mut |f| progress(f / 2.0));
+    let inverted =
+        verify::verify_ctdb_first(job, db, opts, dest.as_deref(), Some(&normal), &mut |f| {
+            progress(0.5 + f / 2.0)
+        });
+    // Normal mode's CTDB check is the same one if it's for the same TOC.
+    let known = inverted
+        .repair_outcome
+        .zip(inverted.repair.clone())
+        .filter(|_| inverted.ctdb_toc == normal.ctdb_toc);
+    maybe_repair(&mut normal, job, root, db, ro, known, progress);
+    match opts.ctdb_first {
+        true => (inverted, Some(normal)),
+        false => (normal, Some(inverted)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn start(
     root: PathBuf,
     threads: usize,
     opts: Options,
+    both: bool,
     prior: Option<Arc<Cache>>,
     ro: RepairOptions,
     db: Arc<Db>,
@@ -205,11 +253,24 @@ fn start(
                         break;
                     };
                     let stamps = cache::stamps(&files);
+                    let other_opts = Options {
+                        ctdb_first: !opts.ctdb_first,
+                        ..opts.clone()
+                    };
                     let hit = prior
                         .as_ref()
                         .zip(stamps.as_ref())
                         .and_then(|(c, s)| c.get(&dir, s))
-                        .filter(|albums| verify::cached_valid(albums, &opts));
+                        .filter(|albums| verify::cached_valid(albums, &opts))
+                        // With --both, only skip folders cached in both modes.
+                        .filter(|_| {
+                            !both
+                                || prior
+                                    .as_ref()
+                                    .zip(stamps.as_ref())
+                                    .and_then(|(c, s)| c.get_other(&dir, s))
+                                    .is_some_and(|a| verify::cached_valid(&a, &other_opts))
+                        });
                     if let Some(albums) = hit {
                         let _ = tx.send(Event::Done {
                             worker,
@@ -217,6 +278,7 @@ fn start(
                             stamps,
                             from_cache: true,
                             albums,
+                            other: None,
                         });
                         continue;
                     }
@@ -229,7 +291,7 @@ fn start(
                     let tracks = files.iter().map(|f| scan::probe_track(f)).collect();
                     let jobs = scan::group(&dir, tracks);
                     let n = jobs.len() as f32;
-                    let albums = jobs
+                    let (albums, other): (Vec<_>, Vec<_>) = jobs
                         .iter()
                         .enumerate()
                         .map(|(i, job)| {
@@ -239,32 +301,16 @@ fn start(
                                     frac: (i as f32 + frac) / n,
                                 });
                             };
-                            let mut album = match opts.ctdb_first {
-                                true => {
-                                    let dest = ro
-                                        .out
-                                        .as_ref()
-                                        .map(|o| repair::destination(o, &root, &job.dir));
-                                    verify::verify_ctdb_first(
-                                        job,
-                                        &db,
-                                        &opts,
-                                        dest.as_deref(),
-                                        &mut progress,
-                                    )
-                                }
-                                false => verify::verify(job, &db, &opts, &mut progress),
-                            };
-                            maybe_repair(&mut album, job, &root, &db, &ro, &mut progress);
-                            album
+                            check_album(job, &root, &db, &opts, both, &ro, &mut progress)
                         })
-                        .collect();
+                        .unzip();
                     let _ = tx.send(Event::Done {
                         worker,
                         dir,
                         stamps,
                         from_cache: false,
                         albums,
+                        other: both.then(|| other.into_iter().flatten().collect()),
                     });
                 }
             });

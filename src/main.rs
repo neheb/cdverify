@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#![forbid(unsafe_code)]
+
 mod app;
 mod cache;
 mod crc;
@@ -188,7 +190,8 @@ fn maybe_repair(
 }
 
 /// Checks one album in this run's mode and, with `both`, in the other mode
-/// too, sharing the AccurateRip and CTDB checks between them.
+/// too, sharing the AccurateRip and CTDB checks between them. `prev` holds
+/// cached results for (this mode, the other mode), which are reused.
 #[allow(clippy::too_many_arguments)]
 fn check_album(
     job: &scan::AlbumJob,
@@ -197,6 +200,7 @@ fn check_album(
     opts: &Options,
     both: bool,
     ro: &RepairOptions,
+    prev: (Option<verify::AlbumResult>, Option<verify::AlbumResult>),
     progress: &mut dyn FnMut(f32),
 ) -> (verify::AlbumResult, Option<verify::AlbumResult>) {
     let dest = ro
@@ -211,18 +215,49 @@ fn check_album(
         maybe_repair(&mut album, job, root, db, ro, None, progress);
         return (album, None);
     }
+    let (normal, inverted) = match opts.ctdb_first {
+        true => (prev.1, prev.0),
+        false => (prev.0, prev.1),
+    };
+    let (normal, inverted) = match (normal, inverted) {
+        (Some(n), Some(i)) => (n, i),
+        (Some(normal), None) => {
+            let inverted =
+                verify::verify_ctdb_first(job, db, opts, dest.as_deref(), None, progress).0;
+            (normal, inverted)
+        }
+        (None, Some(inverted)) => {
+            let mut normal = verify::verify(job, db, opts, progress);
+            maybe_repair(&mut normal, job, root, db, ro, None, progress);
+            (normal, inverted)
+        }
+        (None, None) => check_both(job, root, db, opts, dest.as_deref(), ro, progress),
+    };
+    match opts.ctdb_first {
+        true => (inverted, Some(normal)),
+        false => (normal, Some(inverted)),
+    }
+}
+
+/// Both modes' results for an album, from one AccurateRip and one CTDB check.
+fn check_both(
+    job: &scan::AlbumJob,
+    root: &std::path::Path,
+    db: &Db,
+    opts: &Options,
+    dest: Option<&std::path::Path>,
+    ro: &RepairOptions,
+    progress: &mut dyn FnMut(f32),
+) -> (verify::AlbumResult, verify::AlbumResult) {
     let mut normal = verify::verify(job, db, opts, &mut |f| progress(f / 2.0));
     let (inverted, checked) =
-        verify::verify_ctdb_first(job, db, opts, dest.as_deref(), Some(&normal), &mut |f| {
+        verify::verify_ctdb_first(job, db, opts, dest, Some(&normal), &mut |f| {
             progress(0.5 + f / 2.0)
         });
     // Normal mode's CTDB check is the same one if it's for the same TOC.
     let known = checked.filter(|_| inverted.ctdb_toc == normal.ctdb_toc);
     maybe_repair(&mut normal, job, root, db, ro, known, progress);
-    match opts.ctdb_first {
-        true => (inverted, Some(normal)),
-        false => (normal, Some(inverted)),
-    }
+    (normal, inverted)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,7 +276,7 @@ fn start(
         let _ = tx.send(Event::Total(folders.len()));
         let queue = Arc::new(Mutex::new(VecDeque::from(folders)));
         for worker in 0..threads {
-            let (queue, db, opts, tx) = (queue.clone(), db.clone(), opts.clone(), tx.clone());
+            let (queue, db, opts, tx) = (queue.clone(), db.clone(), opts, tx.clone());
             let prior = prior.clone();
             let ro = ro.clone();
             let root = root.clone();
@@ -253,23 +288,20 @@ fn start(
                     let stamps = cache::stamps(&files);
                     let other_opts = Options {
                         ctdb_first: !opts.ctdb_first,
-                        ..opts.clone()
+                        ..opts
                     };
-                    let hit = prior
-                        .as_ref()
-                        .zip(stamps.as_ref())
-                        .and_then(|(c, s)| c.get(&dir, s))
-                        .filter(|albums| verify::cached_valid(albums, &opts))
-                        // With --both, only skip folders cached in both modes.
-                        .filter(|_| {
-                            !both
-                                || prior
-                                    .as_ref()
-                                    .zip(stamps.as_ref())
-                                    .and_then(|(c, s)| c.get_other(&dir, s))
-                                    .is_some_and(|a| verify::cached_valid(&a, &other_opts))
-                        });
-                    if let Some(albums) = hit {
+                    let cached = |other: bool| {
+                        let (c, s) = prior.as_ref().zip(stamps.as_ref())?;
+                        let (albums, o) = match other {
+                            true => (c.get_other(&dir, s)?, &other_opts),
+                            false => (c.get(&dir, s)?, &opts),
+                        };
+                        verify::cached_valid(&albums, o).then_some(albums)
+                    };
+                    let hit = cached(false);
+                    let other_hit = both.then(|| cached(true)).flatten();
+                    // With both modes wanted, only skip folders cached in both.
+                    if let Some(albums) = hit.clone().filter(|_| !both || other_hit.is_some()) {
                         let _ = tx.send(Event::Done {
                             worker,
                             dir,
@@ -289,6 +321,16 @@ fn start(
                     let tracks = files.iter().map(|f| scan::probe_track(f)).collect();
                     let jobs = scan::group(&dir, tracks);
                     let n = jobs.len() as f32;
+                    // A mode that is cached is reused album by album, if the
+                    // albums still line up with this folder's.
+                    let lined_up = |a: Option<Vec<verify::AlbumResult>>| {
+                        a.filter(|a| {
+                            a.len() == jobs.len()
+                                && a.iter().zip(&jobs).all(|(r, j)| r.title == j.title)
+                        })
+                        .map(Vec::into_iter)
+                    };
+                    let (mut hit, mut other_hit) = (lined_up(hit), lined_up(other_hit));
                     let (albums, other): (Vec<_>, Vec<_>) = jobs
                         .iter()
                         .enumerate()
@@ -299,7 +341,11 @@ fn start(
                                     frac: (i as f32 + frac) / n,
                                 });
                             };
-                            check_album(job, &root, &db, &opts, both, &ro, &mut progress)
+                            let prev = (
+                                hit.as_mut().and_then(Iterator::next),
+                                other_hit.as_mut().and_then(Iterator::next),
+                            );
+                            check_album(job, &root, &db, &opts, both, &ro, prev, &mut progress)
                         })
                         .unzip();
                     let _ = tx.send(Event::Done {

@@ -29,6 +29,10 @@ pub fn audio_kind(path: &Path) -> Option<Kind> {
     })
 }
 
+/// Problems that make a track non-CD audio (see `app::is_non_cd`).
+pub const LOSSY: &str = "lossy format";
+pub const UNSUPPORTED: &str = "unsupported format";
+
 /// Returns every folder containing audio files, with its files sorted by name.
 pub fn find_folders(root: &Path) -> Vec<(PathBuf, Vec<PathBuf>)> {
     let mut map: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
@@ -76,11 +80,11 @@ pub fn probe_track(path: &Path) -> TrackInfo {
     };
     match audio_kind(path) {
         Some(Kind::Lossy) => {
-            info.problem = Some("lossy format".into());
+            info.problem = Some(LOSSY.into());
             return info;
         }
         Some(Kind::Unsupported) => {
-            info.problem = Some("unsupported format".into());
+            info.problem = Some(UNSUPPORTED.into());
             return info;
         }
         _ => {}

@@ -61,6 +61,8 @@ pub fn parse(bytes: &[u8], ntracks: usize) -> Result<Vec<Pressing>> {
 pub struct Db {
     pub(crate) agent: ureq::Agent,
     cache: Mutex<HashMap<String, Option<Pressings>>>,
+    /// CTDB responses by URL; one album asks for the same TOC several times.
+    ctdb: Mutex<HashMap<String, Vec<CtdbEntry>>>,
 }
 
 impl Db {
@@ -73,6 +75,7 @@ impl Db {
         Db {
             agent,
             cache: Mutex::new(HashMap::new()),
+            ctdb: Mutex::new(HashMap::new()),
         }
     }
 
@@ -133,8 +136,13 @@ fn ctdb_lookup(db: &Db, toc: &str, fuzzy: bool) -> Result<Vec<CtdbEntry>> {
         "http://db.cuetools.net/lookup2.php?version=3&ctdb=1&fuzzy={}&metadata=none&toc={toc}",
         fuzzy as u8
     );
+    if let Some(hit) = db.ctdb.lock().unwrap().get(&url) {
+        return Ok(hit.clone());
+    }
     let xml = db.agent.get(&url).call()?.body_mut().read_to_string()?;
-    Ok(parse_ctdb_entries(&xml))
+    let entries = parse_ctdb_entries(&xml);
+    db.ctdb.lock().unwrap().insert(url, entries.clone());
+    Ok(entries)
 }
 
 fn parse_ctdb_entries(xml: &str) -> Vec<CtdbEntry> {

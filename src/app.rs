@@ -414,9 +414,9 @@ fn base64(bytes: &[u8]) -> String {
 
 pub fn is_non_cd(a: &AlbumResult) -> bool {
     a.verdict == Verdict::CannotCheck
-        && (a.reason.starts_with("Not CD quality")
-            || a.reason == "lossy format"
-            || a.reason == "unsupported format")
+        && (a.reason.starts_with(crate::verify::NOT_CD_QUALITY)
+            || a.reason == crate::scan::LOSSY
+            || a.reason == crate::scan::UNSUPPORTED)
 }
 
 #[cfg(test)]

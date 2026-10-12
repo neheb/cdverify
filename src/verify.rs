@@ -16,7 +16,7 @@ use crate::disc::{self, DiscId, SECTOR_FRAMES};
 use crate::repair::{self, Outcome};
 use crate::scan::AlbumJob;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Options {
     pub min_confidence: u32,
     pub use_tags: bool,
@@ -745,6 +745,9 @@ fn sample_slip(tracks: &[TrackResult]) -> Option<String> {
     (!notes.is_empty()).then(|| format!("Sample slip: {}", notes.join("; ")))
 }
 
+/// Start of the reason for albums that aren't 44.1 kHz/16-bit stereo.
+pub const NOT_CD_QUALITY: &str = "Not CD quality";
+
 /// Checks that an album can be verified at all (lossless CD audio, complete).
 fn check_eligible(job: &AlbumJob) -> Result<(), String> {
     if let Some(t) = job.tracks.iter().find(|t| t.problem.is_some()) {
@@ -753,7 +756,7 @@ fn check_eligible(job: &AlbumJob) -> Result<(), String> {
     for t in &job.tracks {
         if t.sample_rate != Some(44100) || t.bits != Some(16) || t.channels != Some(2) {
             return Err(format!(
-                "Not CD quality ({} Hz, {} bit, {} ch)",
+                "{NOT_CD_QUALITY} ({} Hz, {} bit, {} ch)",
                 t.sample_rate.unwrap_or(0),
                 t.bits.unwrap_or(0),
                 t.channels.unwrap_or(0)
@@ -812,7 +815,11 @@ fn find_match(k: usize, crc: &TrackCrc, pressings: Option<&[Pressing]>) -> Match
     let mut confidence = 0;
     let mut matched = None;
     let mut top: Option<Entry> = None;
-    for e in pressings.unwrap_or_default().iter().map(|p| p.entries[k]) {
+    for e in pressings
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| p.entries.get(k).copied())
+    {
         if e.crc == 0 {
             continue;
         }
@@ -838,7 +845,8 @@ fn candidate_offsets(pressings: &[Pressing], w: &Frame450Windows, max: usize) ->
     for k in 0..ntracks {
         let targets: Vec<u32> = pressings
             .iter()
-            .map(|p| p.entries[k].crc450)
+            .filter_map(|p| p.entries.get(k))
+            .map(|e| e.crc450)
             .filter(|&c| c != 0)
             .collect();
         if targets.is_empty() {

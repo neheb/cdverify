@@ -367,10 +367,16 @@ impl App {
     }
 }
 
-/// Copies via `wl-copy` on Wayland, otherwise asks the terminal to do it with
-/// an OSC 52 escape sequence (also works over SSH in most terminals).
+/// Copies via the Windows clipboard or `wl-copy` on Wayland, otherwise asks
+/// the terminal to do it with an OSC 52 escape sequence (also works over SSH
+/// in most terminals).
 fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     use std::io::Write;
+
+    #[cfg(windows)]
+    if clipboard_win::set_clipboard_string(text).is_ok() {
+        return Ok(());
+    }
 
     if std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::process::Command::new("wl-copy")

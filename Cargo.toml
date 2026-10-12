@@ -22,3 +22,6 @@ walkdir = "2.5.0"
 
 [profile.release]
 strip = true
+
+[target."cfg(windows)".dependencies]
+clipboard-win = "5.4.1"

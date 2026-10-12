@@ -1,7 +1,7 @@
 # Pushing a tag like v1.2.3 tests the code, builds static Linux binaries for
-# amd64, ARMv6 (Raspberry Pi 1/Zero) and aarch64, and publishes them as a
-# GitHub release. Everything is pure Rust, so rust-lld links all targets
-# without a cross toolchain.
+# amd64, ARMv6 (Raspberry Pi 1/Zero) and aarch64 plus a Windows x64 binary,
+# and publishes them as a GitHub release. Everything is pure Rust, so rust-lld
+# links all Linux targets without a cross toolchain.
 name: Release
 
 on:
@@ -69,8 +69,42 @@ jobs:
           path: accuraterip-tui-*.tar.gz*
           if-no-files-found: error
 
+  windows:
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Static CRT: the .exe runs without the Visual C++ redistributable.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - run: cargo test --locked --release
+      - name: Build
+        run: cargo build --locked --release
+      - name: Package
+        run: |
+          name="accuraterip-tui-${GITHUB_REF_NAME}-windows-x64"
+          mkdir "$name"
+          cp target/release/accuraterip-tui.exe README.md LICENSE "$name/"
+          7z a "$name.zip" "$name"
+          sha256sum "$name.zip" > "$name.zip.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-x64
+          path: accuraterip-tui-*.zip*
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

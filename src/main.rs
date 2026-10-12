@@ -79,7 +79,8 @@ struct Cli {
     /// Re-verify every folder, ignoring cached results (the cache is still updated).
     #[arg(long)]
     rescan: bool,
-    /// Results cache file [default: ~/.cache/accuraterip-tui/cache.json].
+    /// Results cache file [default: ~/.cache/accuraterip-tui/cache.json, or
+    /// %LOCALAPPDATA%\accuraterip-tui\cache.json on Windows].
     #[arg(long)]
     cache: Option<PathBuf>,
 }

@@ -15,13 +15,14 @@ Results are grouped into the same four lists as PerfectTUNES:
 
 ## Install
 
-Each [release](../../releases) has static Linux binaries (no dependencies):
+Each [release](../../releases) has static binaries (no dependencies):
 
 | Archive | For |
 |---------|-----|
 | `linux-amd64` | 64-bit x86 PCs |
 | `linux-armv6` | Raspberry Pi 1 / Zero (also runs on later 32-bit ARM) |
 | `linux-aarch64` | 64-bit ARM (Raspberry Pi 3/4/5, ARM servers) |
+| `windows-x64` | 64-bit Windows 10/11 (`.zip`) |
 
 ```
 tar xzf accuraterip-tui-*-linux-amd64.tar.gz
@@ -45,7 +46,8 @@ Keys: `←/→`, `Tab` or `1`–`4` switch list · `↑/↓` select · `PgUp/PgD
 albums · `c` copy the album's MusicBrainz URL · `r` repair · `e` export report ·
 `q` quit. `Esc` only clears the status message.
 
-Copying uses `wl-copy` on Wayland, otherwise the terminal's clipboard via OSC 52.
+Copying uses the Windows clipboard on Windows and `wl-copy` on Wayland,
+otherwise the terminal's clipboard via OSC 52.
 Omarchy's Super+C doesn't reach the app: in a terminal it becomes
 Ctrl+Shift+C, which the terminal handles itself.
 
@@ -63,7 +65,7 @@ Options:
 - `--no-ctdb`: don't contact the CUETools database (no layout lookups or repair-data checks).
 - `--invert`: use CTDB as the primary source. Albums whose audio matches a CTDB entry exactly are accurate; only the rest are checked against AccurateRip, and those that match neither land in Ripping Errors (with CTDB's repair verdict). Albums CTDB doesn't know go to Cannot Check.
 - `--rescan`: re-verify every folder and ignore cached results (the cache is still updated).
-- `--cache PATH`: results cache location (default `~/.cache/accuraterip-tui/cache.json`). Each run caches results for both normal and `--invert` mode (unless `--no-ctdb` is given), so switching modes doesn't re-verify. The AccurateRip and CTDB checks are shared between the two, costing at most one extra decode per album.
+- `--cache PATH`: results cache location (default `~/.cache/accuraterip-tui/cache.json`, or `%LOCALAPPDATA%\accuraterip-tui\cache.json` on Windows). Each run caches results for both normal and `--invert` mode (unless `--no-ctdb` is given), so switching modes doesn't re-verify. The AccurateRip and CTDB checks are shared between the two, costing at most one extra decode per album.
 
 ## How it works
 

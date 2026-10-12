@@ -402,8 +402,7 @@ pub fn destination(out: &Path, root: &Path, dir: &Path) -> PathBuf {
 
 /// Default folder for repaired copies.
 pub fn default_out() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    std::env::home_dir()
         .unwrap_or_default()
         .join("accuraterip-repaired")
 }

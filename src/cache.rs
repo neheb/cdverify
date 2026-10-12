@@ -61,11 +61,15 @@ pub fn stamps(files: &[PathBuf]) -> Option<Vec<FileStamp>> {
         .collect()
 }
 
+/// `$XDG_CACHE_HOME`, `~/.cache` or, on Windows, `%LOCALAPPDATA%`.
 pub fn default_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let var = |name| std::env::var_os(name).map(PathBuf::from);
+    let base = match cfg!(windows) {
+        true => var("LOCALAPPDATA"),
+        false => var("XDG_CACHE_HOME"),
+    }
+    .or_else(|| std::env::home_dir().map(|h| h.join(".cache")))
+    .unwrap_or_else(|| PathBuf::from("."));
     base.join("accuraterip-tui").join("cache.json")
 }
 

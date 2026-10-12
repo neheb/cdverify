@@ -22,6 +22,9 @@ walkdir = "2.5.0"
 
 [profile.release]
 strip = true
+# About 20% smaller binaries.
+lto = true
+codegen-units = 1
 
 [target."cfg(windows)".dependencies]
 clipboard-win = "5.4.1"

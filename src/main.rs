@@ -391,7 +391,10 @@ fn run_headless(app: &mut App, rx: Receiver<Event>) -> Result<()> {
     while !app.finished() {
         let Ok(ev) = rx.recv() else { break };
         if let Event::Done { albums, .. } = &ev {
-            for a in albums {
+            for a in albums
+                .iter()
+                .filter(|a| !app.skip_non_cd || !app::is_non_cd(a))
+            {
                 println!("{:<18} {}  [{}]", a.verdict.label(), a.title, a.reason);
                 if let Some(r) = &a.repair {
                     println!("{:<18} {r}", "");

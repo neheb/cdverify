@@ -544,7 +544,8 @@ pub fn verify_ctdb_first(
     let offsets = disc::audio_offsets(&sectors);
     let audio_end: u32 = sectors.iter().sum();
     let layout = match ctdb_layout(db, &offsets, audio_end) {
-        Ok(Some(layout)) => layout,
+        Ok(Some(CtdbDisc::AudioOnly)) => None,
+        Ok(Some(CtdbDisc::Layout(layout))) => Some(layout),
         Ok(None) => {
             result.reason = "Not in CTDB".into();
             result.recheck = true;
@@ -614,17 +615,24 @@ pub fn verify_ctdb_first(
     (result, Some((Outcome::Verified, msg)))
 }
 
-/// The layout under which CTDB knows this disc (`None` for audio only),
-/// or `Ok(None)` if it doesn't know it.
-fn ctdb_layout(db: &Db, offsets: &[u32], audio_end: u32) -> Result<Option<Option<TocLayout>>> {
+/// How CTDB knows a disc.
+enum CtdbDisc {
+    /// By the audio tracks alone.
+    AudioOnly,
+    /// With a layout the audio files don't reveal (data track, pregap).
+    Layout(TocLayout),
+}
+
+/// How CTDB knows this disc, or `Ok(None)` if it doesn't.
+fn ctdb_layout(db: &Db, offsets: &[u32], audio_end: u32) -> Result<Option<CtdbDisc>> {
     let plain = db::ctdb_toc(offsets, audio_end, None);
     if db::ctdb_repair_info(db, &plain)?.is_some() {
-        return Ok(Some(None));
+        return Ok(Some(CtdbDisc::AudioOnly));
     }
     Ok(db::ctdb_layouts(db, offsets, audio_end)?
         .into_iter()
         .next()
-        .map(Some))
+        .map(CtdbDisc::Layout))
 }
 
 /// Looks up the data track of an Enhanced CD in CTDB and returns the first

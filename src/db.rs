@@ -145,6 +145,9 @@ fn ctdb_lookup(db: &Db, toc: &str, fuzzy: bool) -> Result<Vec<CtdbEntry>> {
     Ok(entries)
 }
 
+/// Pulls the attributes of each `<entry …>` tag out of a CTDB response. Not a
+/// real XML parser: it relies on CTDB's fixed output (double-quoted attributes,
+/// no `>` inside values), and a tag it can't read is skipped.
 fn parse_ctdb_entries(xml: &str) -> Vec<CtdbEntry> {
     let mut out = Vec::new();
     for entry in xml.split("<entry").skip(1) {

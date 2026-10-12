@@ -2,8 +2,10 @@
 
 //! Verifying one album against AccurateRip.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use anyhow::Result;
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +13,7 @@ use crate::crc::{Frame450Windows, OffsetAccum, TrackCrc};
 use crate::db::{self, Db, Entry, Pressing, TocLayout};
 use crate::decode;
 use crate::disc::{self, DiscId, SECTOR_FRAMES};
+use crate::repair::{self, Outcome};
 use crate::scan::AlbumJob;
 
 #[derive(Debug, Clone)]
@@ -21,6 +24,9 @@ pub struct Options {
     pub max_candidates: usize,
     /// Ask CTDB for the data track of Enhanced CDs missing from AccurateRip.
     pub use_ctdb: bool,
+    /// Check against CTDB first; ask AccurateRip only about albums that
+    /// don't match it.
+    pub ctdb_first: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -54,6 +60,8 @@ pub enum TrackStatus {
     Accurate,
     /// Accurate according to a dBpoweramp `ACCURATERIPRESULT` tag.
     AccurateTag,
+    /// The whole rip matches a CTDB entry (`--invert`).
+    AccurateCtdb,
     LowConfidence,
     Mismatch,
     NotInDb,
@@ -66,6 +74,7 @@ impl TrackStatus {
         match self {
             TrackStatus::Accurate => "Accurate",
             TrackStatus::AccurateTag => "Accurate (tag)",
+            TrackStatus::AccurateCtdb => "Accurate (CTDB)",
             TrackStatus::LowConfidence => "Low confidence",
             TrackStatus::Mismatch => "Mismatch",
             TrackStatus::NotInDb => "Not in DB",
@@ -133,6 +142,9 @@ pub struct AlbumResult {
     /// Explanation of a ripping error, e.g. a sample slip.
     #[serde(default)]
     pub diagnosis: Option<String>,
+    /// Checked with `--invert` (CTDB first).
+    #[serde(default)]
+    pub ctdb_first: bool,
 }
 
 impl AlbumResult {
@@ -145,8 +157,9 @@ impl AlbumResult {
 
 pub type Progress<'a> = &'a mut dyn FnMut(f32);
 
-pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -> AlbumResult {
-    let mut result = AlbumResult {
+/// A result with every track unchecked.
+fn blank_result(job: &AlbumJob) -> AlbumResult {
+    AlbumResult {
         title: job.title.clone(),
         dir: job.dir.clone(),
         verdict: Verdict::CannotCheck,
@@ -165,6 +178,7 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
         ctdb_toc: None,
         repair: None,
         diagnosis: None,
+        ctdb_first: false,
         tracks: job
             .tracks
             .iter()
@@ -181,13 +195,11 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
                 note: t.problem.clone(),
             })
             .collect(),
-    };
-
-    if let Err(reason) = check_eligible(job) {
-        result.reason = reason;
-        return result;
     }
+}
 
+/// Track lengths in sectors of an eligible album; sets the audio-only disc IDs.
+fn identify(job: &AlbumJob, result: &mut AlbumResult) -> Vec<u32> {
     let sectors: Vec<u32> = job
         .tracks
         .iter()
@@ -196,7 +208,13 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
     let id = DiscId::from_track_sectors(&sectors);
     result.disc_id = Some(id.file_name());
     result.url = Some(id.url());
-    let mb_id = disc::musicbrainz_id(&sectors, 0);
+    set_mb_id(job, result, &sectors, 0);
+    sectors
+}
+
+/// Sets the MusicBrainz disc ID for track 1 at `start`, flagging a differing tag.
+fn set_mb_id(job: &AlbumJob, result: &mut AlbumResult, sectors: &[u32], start: u32) {
+    let mb_id = disc::musicbrainz_id(sectors, start);
     result.mb_tag_mismatch = job
         .tracks
         .iter()
@@ -204,6 +222,15 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
         .find(|t| **t != mb_id)
         .cloned();
     result.mb_disc_id = Some(mb_id);
+}
+
+pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -> AlbumResult {
+    let mut result = blank_result(job);
+    if let Err(reason) = check_eligible(job) {
+        result.reason = reason;
+        return result;
+    }
+    let sectors = identify(job, &mut result);
 
     if opts.use_tags {
         let tagged: Option<Vec<u32>> = job
@@ -229,7 +256,7 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
         }))
         .collect();
 
-    let lookup = db.lookup(&id);
+    let lookup = db.lookup(&DiscId::from_track_sectors(&sectors));
     let mut pressings = match &lookup {
         Ok(Some(p)) if !p.is_empty() => Some(p.clone()),
         _ => None,
@@ -362,16 +389,7 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
                 result.data_track = Some(m.note);
                 match m.layout {
                     TocLayout::DataFirst { .. } => data_first = true,
-                    TocLayout::Pregap { start } => {
-                        let mb_id = disc::musicbrainz_id(&sectors, start);
-                        result.mb_tag_mismatch = job
-                            .tracks
-                            .iter()
-                            .filter_map(|t| t.mb_disc_id.as_ref())
-                            .find(|t| **t != mb_id)
-                            .cloned();
-                        result.mb_disc_id = Some(mb_id);
-                    }
+                    TocLayout::Pregap { start } => set_mb_id(job, &mut result, &sectors, start),
                     TocLayout::DataLast { .. } => {}
                 }
             }
@@ -491,14 +509,112 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
 
 /// Whether cached results still hold under the current options.
 pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
-    albums
-        .iter()
-        .flat_map(|a| &a.tracks)
-        .all(|t| match t.status {
-            TrackStatus::Accurate => t.confidence >= opts.min_confidence,
-            TrackStatus::AccurateTag => opts.use_tags,
-            _ => true,
-        })
+    // Results from the other mode answer a different question.
+    albums.iter().all(|a| a.ctdb_first == opts.ctdb_first)
+        && albums
+            .iter()
+            .flat_map(|a| &a.tracks)
+            .all(|t| match t.status {
+                TrackStatus::Accurate => t.confidence >= opts.min_confidence,
+                TrackStatus::AccurateTag => opts.use_tags,
+                _ => true,
+            })
+}
+
+/// `--invert`: checks the album against CTDB's parity data and asks
+/// AccurateRip only about albums that don't match it. `dest` is where
+/// repaired copies go (`--repair`).
+pub fn verify_ctdb_first(
+    job: &AlbumJob,
+    db: &Db,
+    opts: &Options,
+    dest: Option<&Path>,
+    progress: Progress<'_>,
+) -> AlbumResult {
+    let mut result = blank_result(job);
+    result.ctdb_first = true;
+    if let Err(reason) = check_eligible(job) {
+        result.reason = reason;
+        return result;
+    }
+    let sectors = identify(job, &mut result);
+    let offsets = disc::audio_offsets(&sectors);
+    let audio_end: u32 = sectors.iter().sum();
+    let layout = match ctdb_layout(db, &offsets, audio_end) {
+        Ok(Some(layout)) => layout,
+        Ok(None) => {
+            result.reason = "Not in CTDB".into();
+            result.recheck = true;
+            return result;
+        }
+        Err(e) => {
+            result.reason = format!("CTDB lookup failed: {e}");
+            result.recheck = true;
+            return result;
+        }
+    };
+    let toc = db::ctdb_toc(&offsets, audio_end, layout);
+    let (outcome, msg) = repair::run(job, &toc, db, dest, progress);
+    if outcome != Outcome::Verified {
+        // Not a clean CTDB match: let AccurateRip have its say.
+        let mut ar = verify(job, db, opts, progress);
+        ar.ctdb_first = true;
+        ar.ctdb_known = outcome != Outcome::Failed;
+        ar.ctdb_toc = Some(toc);
+        ar.repair_outcome = Some(outcome);
+        ar.repair = Some(msg);
+        match ar.verdict {
+            Verdict::Accurate => ar.reason.push_str("; differs from CTDB"),
+            Verdict::RipErrors => {
+                ar.reason = format!("{}; {}", ar.reason, outcome.verdict_note());
+            }
+            Verdict::Corrupted => {}
+            Verdict::CannotCheck if outcome == Outcome::Failed => {}
+            Verdict::CannotCheck => {
+                ar.reason = format!(
+                    "Doesn't match CTDB, {}; AccurateRip: {}",
+                    outcome.verdict_note(),
+                    ar.reason
+                );
+                ar.verdict = Verdict::RipErrors;
+                ar.recheck = true;
+            }
+        }
+        return ar;
+    }
+
+    if let Some(layout) = layout {
+        let (id, note) = layout_id(&sectors, layout);
+        result.disc_id = Some(id.file_name());
+        result.url = Some(id.url());
+        result.data_track = Some(note);
+        if let TocLayout::Pregap { start } = layout {
+            set_mb_id(job, &mut result, &sectors, start);
+        }
+    }
+    for t in &mut result.tracks {
+        t.status = TrackStatus::AccurateCtdb;
+    }
+    result.verdict = Verdict::Accurate;
+    result.reason = "Accurate (matches CTDB)".into();
+    result.ctdb_known = true;
+    result.ctdb_toc = Some(toc);
+    result.repair_outcome = Some(outcome);
+    result.repair = Some(msg);
+    result
+}
+
+/// The layout under which CTDB knows this disc (`None` for audio only),
+/// or `Ok(None)` if it doesn't know it.
+fn ctdb_layout(db: &Db, offsets: &[u32], audio_end: u32) -> Result<Option<Option<TocLayout>>> {
+    let plain = db::ctdb_toc(offsets, audio_end, None);
+    if db::ctdb_repair_info(db, &plain)?.is_some() {
+        return Ok(Some(None));
+    }
+    Ok(db::ctdb_layouts(db, offsets, audio_end)?
+        .into_iter()
+        .next()
+        .map(Some))
 }
 
 /// Looks up the data track of an Enhanced CD in CTDB and returns the first
@@ -521,31 +637,7 @@ fn find_layouts(db: &Db, sectors: &[u32]) -> Vec<(LayoutMatch, db::Pressings)> {
         .into_iter()
         .take(5)
         .filter_map(|layout| {
-            let (id, note) = match layout {
-                TocLayout::DataLast { start, leadout } => (
-                    DiscId::with_data_track(sectors, start, leadout),
-                    format!(
-                        "Enhanced CD: data track at sector {start}, {} sectors long (from CTDB)",
-                        leadout - start
-                    ),
-                ),
-                TocLayout::DataFirst {
-                    audio_start,
-                    leadout,
-                } => (
-                    DiscId::with_leading_data_track(sectors, audio_start, leadout),
-                    format!(
-                        "Mixed-mode CD: data track 1, {audio_start} sectors long (from CTDB); \
-                         AccurateRip has no entry for the last track"
-                    ),
-                ),
-                TocLayout::Pregap { start } => (
-                    DiscId::with_pregap(sectors, start),
-                    format!(
-                        "Track 1 starts at sector {start}; the pregap isn't in the rip (from CTDB)"
-                    ),
-                ),
-            };
+            let (id, note) = layout_id(sectors, layout);
             let mut pressings = db.lookup(&id).ok().flatten().filter(|p| !p.is_empty())?;
             if matches!(layout, TocLayout::DataFirst { .. }) {
                 pressings = Arc::new(shift_out_data_track(&pressings));
@@ -553,6 +645,34 @@ fn find_layouts(db: &Db, sectors: &[u32]) -> Vec<(LayoutMatch, db::Pressings)> {
             Some((LayoutMatch { layout, id, note }, pressings))
         })
         .collect()
+}
+
+/// The AccurateRip ID of our audio tracks laid out as `layout`, with a note
+/// describing the layout.
+fn layout_id(sectors: &[u32], layout: TocLayout) -> (DiscId, String) {
+    match layout {
+        TocLayout::DataLast { start, leadout } => (
+            DiscId::with_data_track(sectors, start, leadout),
+            format!(
+                "Enhanced CD: data track at sector {start}, {} sectors long (from CTDB)",
+                leadout - start
+            ),
+        ),
+        TocLayout::DataFirst {
+            audio_start,
+            leadout,
+        } => (
+            DiscId::with_leading_data_track(sectors, audio_start, leadout),
+            format!(
+                "Mixed-mode CD: data track 1, {audio_start} sectors long (from CTDB); \
+                         AccurateRip has no entry for the last track"
+            ),
+        ),
+        TocLayout::Pregap { start } => (
+            DiscId::with_pregap(sectors, start),
+            format!("Track 1 starts at sector {start}; the pregap isn't in the rip (from CTDB)"),
+        ),
+    }
 }
 
 /// On discs that start with a data track, AccurateRip's entries are numbered

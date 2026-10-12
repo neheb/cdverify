@@ -47,7 +47,10 @@ pub fn text(albums: &[AlbumResult]) -> String {
                 continue;
             }
             for t in &a.tracks {
-                if matches!(t.status, TrackStatus::Accurate | TrackStatus::AccurateTag) {
+                if matches!(
+                    t.status,
+                    TrackStatus::Accurate | TrackStatus::AccurateTag | TrackStatus::AccurateCtdb
+                ) {
                     continue;
                 }
                 let crc = |c: Option<u32>| c.map_or("--------".into(), |c| format!("{c:08X}"));

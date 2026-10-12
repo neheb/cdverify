@@ -266,7 +266,9 @@ fn verdict_style(v: Verdict) -> Style {
 
 fn status_style(s: TrackStatus) -> Style {
     match s {
-        TrackStatus::Accurate | TrackStatus::AccurateTag => Style::new().green(),
+        TrackStatus::Accurate | TrackStatus::AccurateTag | TrackStatus::AccurateCtdb => {
+            Style::new().green()
+        }
         TrackStatus::Mismatch => Style::new().red(),
         TrackStatus::Corrupted => Style::new().magenta(),
         TrackStatus::LowConfidence | TrackStatus::NotInDb => Style::new().yellow(),

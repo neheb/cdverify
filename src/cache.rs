@@ -147,6 +147,7 @@ mod tests {
             ctdb_toc: None,
             repair: None,
             diagnosis: None,
+            ctdb_first: false,
         }
     }
 

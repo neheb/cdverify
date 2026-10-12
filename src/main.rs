@@ -64,6 +64,10 @@ struct Cli {
     /// CDs that AccurateRip doesn't know by their audio tracks alone.
     #[arg(long)]
     no_ctdb: bool,
+    /// Use CTDB as the primary source: albums matching CTDB's parity data are
+    /// accurate, and only those that don't are checked against AccurateRip.
+    #[arg(long, conflicts_with = "no_ctdb")]
+    invert: bool,
     /// Repair albums with ripping errors using CTDB's repair data, writing
     /// corrected copies of the damaged tracks under this folder (mirroring
     /// the library layout). The library itself is never modified.
@@ -88,6 +92,7 @@ fn main() -> Result<()> {
         offset_range: cli.offset_range,
         max_candidates: 4,
         use_ctdb: !cli.no_ctdb,
+        ctdb_first: cli.invert,
     };
     let threads = cli
         .threads
@@ -146,6 +151,10 @@ fn maybe_repair(
     ro: &RepairOptions,
     progress: &mut dyn FnMut(f32),
 ) {
+    // Already checked against CTDB (--invert).
+    if album.repair_outcome.is_some() {
+        return;
+    }
     let wants = ro.check_all
         || (album.verdict == verify::Verdict::RipErrors
             && album.ctdb_known
@@ -230,7 +239,22 @@ fn start(
                                     frac: (i as f32 + frac) / n,
                                 });
                             };
-                            let mut album = verify::verify(job, &db, &opts, &mut progress);
+                            let mut album = match opts.ctdb_first {
+                                true => {
+                                    let dest = ro
+                                        .out
+                                        .as_ref()
+                                        .map(|o| repair::destination(o, &root, &job.dir));
+                                    verify::verify_ctdb_first(
+                                        job,
+                                        &db,
+                                        &opts,
+                                        dest.as_deref(),
+                                        &mut progress,
+                                    )
+                                }
+                                false => verify::verify(job, &db, &opts, &mut progress),
+                            };
                             maybe_repair(&mut album, job, &root, &db, &ro, &mut progress);
                             album
                         })

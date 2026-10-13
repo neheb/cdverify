@@ -139,8 +139,13 @@ fn ctdb_lookup(db: &Db, toc: &str, fuzzy: bool) -> Result<Vec<CtdbEntry>> {
     if let Some(hit) = db.ctdb.lock().unwrap().get(&url) {
         return Ok(hit.clone());
     }
-    let xml = db.agent.get(&url).call()?.body_mut().read_to_string()?;
-    let entries = parse_ctdb_entries(&xml);
+    let entries = match db.agent.get(&url).call() {
+        Ok(mut resp) => parse_ctdb_entries(&resp.body_mut().read_to_string()?),
+        // An exact TOC CTDB doesn't know gets a 404 rather than an empty
+        // document; treat it like an empty result.
+        Err(ureq::Error::StatusCode(404)) => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
     db.ctdb.lock().unwrap().insert(url, entries.clone());
     Ok(entries)
 }

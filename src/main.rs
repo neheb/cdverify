@@ -33,7 +33,7 @@ use cache::Cache;
 use db::Db;
 use verify::Options;
 
-/// Checks a music library's lossless CD rips against the AccurateRip database.
+/// Checks a music library's lossless CD rips against AccurateRip and CTDB.
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Cli {
@@ -57,7 +57,7 @@ struct Cli {
     skip_non_cd: bool,
     /// Report path (JSON; a .txt summary is written alongside). Written on `e`,
     /// or automatically when finished in --headless mode.
-    #[arg(long, default_value = "accuraterip-report.json")]
+    #[arg(long, default_value = "cdverify-report.json")]
     report: PathBuf,
     /// No TUI: print one line per album and write the report when done.
     #[arg(long)]
@@ -81,8 +81,8 @@ struct Cli {
     /// Re-verify every folder, ignoring cached results (the cache is still updated).
     #[arg(long)]
     rescan: bool,
-    /// Results cache file [default: ~/.cache/accuraterip-tui/cache.json, or
-    /// %LOCALAPPDATA%\accuraterip-tui\cache.json on Windows].
+    /// Results cache file [default: ~/.cache/cdverify/cache.json, or
+    /// %LOCALAPPDATA%\cdverify\cache.json on Windows].
     #[arg(long)]
     cache: Option<PathBuf>,
 }

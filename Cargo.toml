@@ -1,12 +1,12 @@
 [package]
-name = "accuraterip-tui"
+name = "cdverify"
 version = "0.1.0"
 edition = "2024"
 authors = ["Rosen Penev"]
 description = "Verify CD rips against AccurateRip and CTDB, and repair them with CTDB parity data"
 license = "GPL-3.0-or-later"
 readme = "README.md"
-repository = "https://github.com/neheb/accuraterip-tui"
+repository = "https://github.com/neheb/cdverify"
 
 [dependencies]
 anyhow = "1.0.104"

@@ -69,7 +69,7 @@ impl Db {
     pub fn new() -> Db {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(20)))
-            .user_agent(concat!("accuraterip-tui/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("cdverify/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
         Db {

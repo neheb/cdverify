@@ -1,8 +1,9 @@
-# accuraterip-tui
+# cdverify
 
 A simplified, terminal version of PerfectTUNES' AccurateRip checker. It scans a
 music library, groups tracks into albums and verifies each album against the
-[AccurateRip](http://www.accuraterip.com) database.
+[AccurateRip](http://www.accuraterip.com) database and the CUETools database
+(CTDB), which can also repair rips with errors.
 
 Results are grouped into the same four lists as PerfectTUNES:
 
@@ -25,8 +26,8 @@ Each [release](../../releases) has static binaries (no dependencies):
 | `windows-x64` | 64-bit Windows 10/11 (`.zip`) |
 
 ```
-tar xzf accuraterip-tui-*-linux-amd64.tar.gz
-./accuraterip-tui-*-linux-amd64/accuraterip-tui ~/Music
+tar xzf cdverify-*-linux-amd64.tar.gz
+./cdverify-*-linux-amd64/cdverify ~/Music
 ```
 
 Or build from source with `cargo build --release`. Repairs use the `flac`
@@ -65,7 +66,7 @@ Options:
 - `--no-ctdb`: don't contact the CUETools database (no layout lookups or repair-data checks).
 - `--invert`: use CTDB as the primary source. Albums whose audio matches a CTDB entry exactly are accurate; only the rest are checked against AccurateRip, and those that match neither land in Ripping Errors (with CTDB's repair verdict). Albums CTDB doesn't know (or can't be reached for) get AccurateRip's verdict.
 - `--rescan`: re-verify every folder and ignore cached results (the cache is still updated).
-- `--cache PATH`: results cache location (default `~/.cache/accuraterip-tui/cache.json`, or `%LOCALAPPDATA%\accuraterip-tui\cache.json` on Windows). Each run caches results for both normal and `--invert` mode (unless `--no-ctdb` is given), so switching modes doesn't re-verify. The AccurateRip and CTDB checks are shared between the two, costing at most one extra decode per album.
+- `--cache PATH`: results cache location (default `~/.cache/cdverify/cache.json`, or `%LOCALAPPDATA%\cdverify\cache.json` on Windows). Each run caches results for both normal and `--invert` mode (unless `--no-ctdb` is given), so switching modes doesn't re-verify. The AccurateRip and CTDB checks are shared between the two, costing at most one extra decode per album.
 
 ## How it works
 

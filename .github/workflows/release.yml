@@ -58,15 +58,15 @@ jobs:
         run: cargo build --locked --release --target "$TARGET"
       - name: Package
         run: |
-          name="accuraterip-tui-${GITHUB_REF_NAME}-linux-${ARCH}"
+          name="cdverify-${GITHUB_REF_NAME}-linux-${ARCH}"
           mkdir "$name"
-          cp "target/$TARGET/release/accuraterip-tui" README.md LICENSE "$name/"
+          cp "target/$TARGET/release/cdverify" README.md LICENSE "$name/"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.arch }}
-          path: accuraterip-tui-*.tar.gz*
+          path: cdverify-*.tar.gz*
           if-no-files-found: error
 
   windows:
@@ -92,15 +92,15 @@ jobs:
         run: cargo build --locked --release
       - name: Package
         run: |
-          name="accuraterip-tui-${GITHUB_REF_NAME}-windows-x64"
+          name="cdverify-${GITHUB_REF_NAME}-windows-x64"
           mkdir "$name"
-          cp target/release/accuraterip-tui.exe README.md LICENSE "$name/"
+          cp target/release/cdverify.exe README.md LICENSE "$name/"
           7z a "$name.zip" "$name"
           sha256sum "$name.zip" > "$name.zip.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-x64
-          path: accuraterip-tui-*.zip*
+          path: cdverify-*.zip*
           if-no-files-found: error
 
   release:

@@ -61,7 +61,8 @@ pub fn stamps(files: &[PathBuf]) -> Option<Vec<FileStamp>> {
         .collect()
 }
 
-/// `$XDG_CACHE_HOME`, `~/.cache` or, on Windows, `%LOCALAPPDATA%`.
+/// `$XDG_CACHE_HOME`, `~/.cache` or, on Windows, `%LOCALAPPDATA%`. Moves the
+/// cache over from before the rename to cdverify if there is one.
 pub fn default_path() -> PathBuf {
     let var = |name| std::env::var_os(name).map(PathBuf::from);
     let base = match cfg!(windows) {
@@ -70,7 +71,12 @@ pub fn default_path() -> PathBuf {
     }
     .or_else(|| std::env::home_dir().map(|h| h.join(".cache")))
     .unwrap_or_else(|| PathBuf::from("."));
-    base.join("accuraterip-tui").join("cache.json")
+    let dir = base.join("cdverify");
+    let old = base.join("accuraterip-tui");
+    if !dir.exists() && old.is_dir() {
+        let _ = std::fs::rename(&old, &dir);
+    }
+    dir.join("cache.json")
 }
 
 impl Cache {

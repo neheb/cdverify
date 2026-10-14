@@ -3,23 +3,6 @@
 version = 4
 
 [[package]]
-name = "accuraterip-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "clipboard-win",
- "flacenc",
- "ratatui",
- "serde",
- "serde_json",
- "sha1",
- "symphonia",
- "ureq",
- "walkdir",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -220,6 +203,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "cdverify"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clipboard-win",
+ "flacenc",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "sha1",
+ "symphonia",
+ "ureq",
+ "walkdir",
 ]
 
 [[package]]

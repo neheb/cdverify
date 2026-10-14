@@ -74,7 +74,7 @@ fn encode_with_flac_binary(pcm: &[i16]) -> Result<Vec<u8>> {
     // Encode to a file, not stdout: flac can only fill in STREAMINFO's
     // sample count and MD5 (and write a seek table) when it can seek.
     let tmp = std::env::temp_dir().join(format!(
-        "accuraterip-tui-{}-{:?}.flac",
+        "cdverify-{}-{:?}.flac",
         std::process::id(),
         std::thread::current().id()
     ));

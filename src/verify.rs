@@ -522,6 +522,23 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
             })
 }
 
+/// The AccurateRip result for an --invert check: `ar` if given, else a fresh
+/// [`verify`].
+fn accuraterip(
+    job: &AlbumJob,
+    db: &Db,
+    opts: &Options,
+    ar: Option<&AlbumResult>,
+    progress: Progress<'_>,
+) -> AlbumResult {
+    let mut ar = match ar {
+        Some(a) => a.clone(),
+        None => verify(job, db, opts, progress),
+    };
+    ar.ctdb_first = true;
+    ar
+}
+
 /// `--invert`: checks the album against CTDB's parity data and asks
 /// AccurateRip only about albums that don't match it, reusing `ar` (a
 /// [`verify`] result) if given. `dest` is where repaired copies go
@@ -547,15 +564,19 @@ pub fn verify_ctdb_first(
     let layout = match ctdb_layout(db, &offsets, audio_end) {
         Ok(Some(CtdbDisc::AudioOnly)) => None,
         Ok(Some(CtdbDisc::Layout(layout))) => Some(layout),
+        // CTDB can't say: AccurateRip has the final word.
         Ok(None) => {
-            result.reason = "Not in CTDB".into();
-            result.recheck = true;
-            return (result, None);
+            let mut ar = accuraterip(job, db, opts, ar, progress);
+            if !ar.reason.contains("CTDB") {
+                ar.reason.push_str("; not in CTDB");
+            }
+            return (ar, None);
         }
         Err(e) => {
-            result.reason = format!("CTDB lookup failed: {e}");
-            result.recheck = true;
-            return (result, None);
+            let mut ar = accuraterip(job, db, opts, ar, progress);
+            ar.reason = format!("{}; CTDB lookup failed: {e}", ar.reason);
+            ar.recheck = true;
+            return (ar, None);
         }
     };
     let toc = db::ctdb_toc(&offsets, audio_end, layout);
@@ -566,11 +587,7 @@ pub fn verify_ctdb_first(
             Err(e) => repair::failed(e),
         };
         // Not a clean CTDB match: let AccurateRip have its say.
-        let mut ar = match ar {
-            Some(a) => a.clone(),
-            None => verify(job, db, opts, progress),
-        };
-        ar.ctdb_first = true;
+        let mut ar = accuraterip(job, db, opts, ar, progress);
         ar.ctdb_known = outcome != Outcome::Failed;
         ar.ctdb_toc = Some(toc);
         ar.repair_outcome = Some(outcome);

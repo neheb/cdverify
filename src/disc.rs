@@ -20,6 +20,7 @@ pub struct DiscId {
 
 impl DiscId {
     /// Builds the disc ID from the length of each track in sectors.
+    #[cfg(test)]
     pub fn from_track_sectors(sectors: &[u32]) -> DiscId {
         let offsets = audio_offsets(sectors);
         let leadout = sectors.iter().sum();

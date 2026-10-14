@@ -13,6 +13,8 @@ use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 
+use crate::scan::TrackInfo;
+
 pub struct Opened {
     pub format: Box<dyn FormatReader>,
     pub decoder: Box<dyn AudioDecoder>,
@@ -101,4 +103,72 @@ pub fn decode(path: &Path, verify: bool, mut sink: impl FnMut(&[u32])) -> Result
     }
     let verify_ok = decoder.finalize().verify_ok;
     Ok(Decoded { frames, verify_ok })
+}
+
+/// Decodes an album's tracks in order, each file once (a CD image holds
+/// several tracks), handing `sink` each run of frames with its position in
+/// the album: 0 is the start of track 1, so an image's pregap is skipped.
+/// Returns, per track, why it's damaged, if it is.
+pub fn decode_album(
+    tracks: &[TrackInfo],
+    verify: bool,
+    mut sink: impl FnMut(u64, &[u32]),
+) -> Vec<Option<String>> {
+    let mut notes = vec![None; tracks.len()];
+    let mut album_pos = 0u64;
+    let mut k = 0;
+    while k < tracks.len() {
+        let path = &tracks[k].path;
+        let end = tracks[k..]
+            .iter()
+            .position(|t| t.path != *path || t.image_start.is_none())
+            .map_or(tracks.len(), |n| (k + n).max(k + 1));
+        let skip = tracks[k].image_start.unwrap_or(0);
+        let lens: Vec<u64> = tracks[k..end]
+            .iter()
+            .map(|t| t.frames.unwrap_or(0))
+            .collect();
+        let len: u64 = lens.iter().sum();
+        let mut file_pos = 0u64;
+        let outcome = decode(path, verify, |frames| {
+            let n = frames.len() as u64;
+            let a = skip.saturating_sub(file_pos).min(n) as usize;
+            let b = (skip + len).saturating_sub(file_pos).min(n) as usize;
+            if a < b {
+                sink(album_pos + file_pos + a as u64 - skip, &frames[a..b]);
+            }
+            file_pos += n;
+        });
+        // Tracks from the one holding frame `at` of the file on.
+        let from = |at: u64| {
+            let mut track_end = skip;
+            lens.iter()
+                .position(|l| {
+                    track_end += l;
+                    track_end > at
+                })
+                .unwrap_or(lens.len() - 1)
+        };
+        let expected = skip + len;
+        let (first, note) = match outcome {
+            Err(e) => (from(file_pos), Some(format!("decode error: {e}"))),
+            Ok(d) if d.verify_ok == Some(false) => (0, Some("MD5 mismatch".into())),
+            Ok(d) if d.frames != expected => {
+                let note = match end - k {
+                    1 => format!("decoded {} frames, expected {}", d.frames, len),
+                    _ => format!("image decoded to {} frames, expected {expected}", d.frames),
+                };
+                (from(d.frames.min(expected)), Some(note))
+            }
+            Ok(_) => (0, None),
+        };
+        if let Some(note) = note {
+            for n in &mut notes[k + first..end] {
+                *n = Some(note.clone());
+            }
+        }
+        album_pos += len;
+        k = end;
+    }
+    notes
 }

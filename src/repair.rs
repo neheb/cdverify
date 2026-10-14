@@ -190,28 +190,25 @@ pub fn analyze(
     let mut enc = ParityEncoder::new(geo);
     let mut crc = Crc32::new();
     let mut pos = 0u64;
-    for (k, t) in job.tracks.iter().enumerate() {
-        let decoded = decode::decode(&t.path, false, |frames| {
-            enc.push(frames);
-            for &f in frames {
-                for w in windows.iter_mut() {
-                    if pos >= w.start && pos < w.start + 2 * reach + 1 {
-                        w.crcs.push(crc.value());
-                    }
+    let notes = decode::decode_album(&job.tracks, false, |_, frames| {
+        enc.push(frames);
+        for &f in frames {
+            for w in windows.iter_mut() {
+                if pos >= w.start && pos < w.start + 2 * reach + 1 {
+                    w.crcs.push(crc.value());
                 }
-                crc.update(&f.to_le_bytes());
-                pos += 1;
             }
-            progress(pos as f32 / samples as f32);
-        })?;
-        if decoded.frames != bounds[k + 1] - bounds[k] {
-            bail!(
-                "track {} decoded to {} frames, expected {}",
-                k + 1,
-                decoded.frames,
-                bounds[k + 1] - bounds[k]
-            );
+            crc.update(&f.to_le_bytes());
+            pos += 1;
         }
+        progress(pos as f32 / samples as f32);
+    });
+    if let Some((k, note)) = notes
+        .iter()
+        .enumerate()
+        .find_map(|(k, n)| n.as_ref().map(|n| (k, n)))
+    {
+        bail!("track {}: {note}", k + 1);
     }
     for w in windows.iter_mut() {
         if pos >= w.start && pos < w.start + 2 * reach + 1 {
@@ -407,8 +404,9 @@ pub fn default_out() -> PathBuf {
         .join("accuraterip-repaired")
 }
 
-/// Writes corrected copies of the affected tracks into `out_dir`. Returns
-/// the files written and the encoder used.
+/// Writes corrected copies of the files holding the affected tracks (a
+/// whole CD image, if that's what the album is) into `out_dir`. Returns the
+/// files written and the encoder used.
 pub fn write_repaired(
     job: &AlbumJob,
     analysis: &Analysis,
@@ -434,13 +432,25 @@ pub fn write_repaired(
             );
         }
     }
+    // The files to rewrite, as ranges of the tracks they hold.
+    let mut files: Vec<(usize, usize)> = Vec::new();
+    for &number in &tracks {
+        let k = number as usize - 1;
+        let same = |i: &usize| job.tracks[*i].path == job.tracks[k].path;
+        let first = (0..=k).rev().take_while(same).last().unwrap_or(k);
+        let last = (k..job.tracks.len()).take_while(same).last().unwrap_or(k);
+        if !files.contains(&(first, last + 1)) {
+            files.push((first, last + 1));
+        }
+    }
     let mut written = Vec::new();
     let mut encoder = "";
-    for (n, &number) in tracks.iter().enumerate() {
-        let k = number as usize - 1;
-        let track = &job.tracks[k];
-        let (start, end) = (bounds[k], bounds[k + 1]);
-        let mut pcm: Vec<i16> = Vec::with_capacity(((end - start) * 2) as usize);
+    for (n, &(first, last)) in files.iter().enumerate() {
+        let track = &job.tracks[first];
+        let (start, end) = (bounds[first], bounds[last]);
+        // An image's pregap precedes the album's first frame.
+        let skip = track.image_start.unwrap_or(0);
+        let mut pcm: Vec<i16> = Vec::with_capacity(((skip + end - start) * 2) as usize);
         decode::decode(&track.path, false, |frames| {
             for &f in frames {
                 pcm.push(f as u16 as i16);
@@ -452,8 +462,9 @@ pub fn write_repaired(
             .iter()
             .filter(|f| f.word >= first_word && f.word < (end * 2) as usize)
         {
-            let i = f.word - first_word;
-            pcm[i] = (pcm[i] as u16 ^ f.diff) as i16;
+            let i = f.word - first_word + (skip * 2) as usize;
+            let s = pcm.get_mut(i).context("repaired file decoded short")?;
+            *s = (*s as u16 ^ f.diff) as i16;
         }
         let name = track
             .path
@@ -462,7 +473,7 @@ pub fn write_repaired(
         let out = out_dir.join(name);
         encoder = flacout::write_track(&track.path, &out, &pcm)?;
         written.push(out);
-        progress((n + 1) as f32 / tracks.len() as f32);
+        progress((n + 1) as f32 / files.len() as f32);
     }
     Ok((written, encoder))
 }

@@ -198,19 +198,25 @@ fn blank_result(job: &AlbumJob) -> AlbumResult {
     }
 }
 
-/// Track lengths in sectors of an eligible album and its audio-only
-/// AccurateRip ID; sets the audio-only disc IDs.
+/// Track lengths in sectors of an eligible album and its AccurateRip ID
+/// (audio-only, or with a CD image's pregap); sets the disc IDs.
 fn identify(job: &AlbumJob, result: &mut AlbumResult) -> (Vec<u32>, DiscId) {
     let sectors: Vec<u32> = job
         .tracks
         .iter()
         .map(|t| (t.frames.unwrap() / SECTOR_FRAMES) as u32)
         .collect();
-    let id = DiscId::from_track_sectors(&sectors);
+    let id = DiscId::with_pregap(&sectors, job.pregap());
     result.disc_id = Some(id.file_name());
     result.url = Some(id.url());
-    set_mb_id(job, result, &sectors, 0);
+    set_mb_id(job, result, &sectors, job.pregap());
     (sectors, id)
+}
+
+/// The layout a CD image's CUE sheet gives: a pregap before track 1.
+fn image_layout(job: &AlbumJob) -> Option<TocLayout> {
+    let start = job.pregap();
+    (start > 0).then_some(TocLayout::Pregap { start })
 }
 
 /// Sets the MusicBrainz disc ID for track 1 at `start`, flagging a differing tag.
@@ -268,25 +274,13 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
     let mut windows = Frame450Windows::new(opts.offset_range, &bounds);
     let total = *bounds.last().unwrap() as f32;
     let passes = 1.5;
+    let notes = decode::decode_album(&job.tracks, true, |pos, frames| {
+        acc0.push(pos, frames);
+        windows.push(pos, frames);
+        progress((pos + frames.len() as u64) as f32 / total / passes);
+    });
     let mut corrupted = vec![false; job.tracks.len()];
-    for (k, track) in job.tracks.iter().enumerate() {
-        let mut pos = bounds[k];
-        let outcome = decode::decode(&track.path, true, |frames| {
-            acc0.push(pos, frames);
-            windows.push(pos, frames);
-            pos += frames.len() as u64;
-            progress(pos as f32 / total / passes);
-        });
-        let note = match outcome {
-            Err(e) => Some(format!("decode error: {e}")),
-            Ok(d) if d.verify_ok == Some(false) => Some("MD5 mismatch".into()),
-            Ok(d) if d.frames != bounds[k + 1] - bounds[k] => Some(format!(
-                "decoded {} frames, expected {}",
-                d.frames,
-                bounds[k + 1] - bounds[k]
-            )),
-            Ok(_) => None,
-        };
+    for (k, note) in notes.into_iter().enumerate() {
         if let Some(note) = note {
             corrupted[k] = true;
             result.tracks[k].note = Some(note);
@@ -305,12 +299,15 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
     // audio files don't fully reveal: a data track (Enhanced or mixed-mode
     // CD) or a pregap before track 1 that wasn't ripped. If the audio-only ID
     // is unknown or doesn't fully match, ask CTDB for the real layouts and
-    // try those IDs too.
+    // try those IDs too. An image's CUE sheet already gives the layout.
     let mut sets: Vec<(Option<LayoutMatch>, db::Pressings)> = Vec::new();
     if let Some(p) = pressings.take() {
         sets.push((None, p));
     }
-    if opts.use_ctdb && !sets.first().is_some_and(|(_, p)| matched_at_zero(p)) {
+    if opts.use_ctdb
+        && image_layout(job).is_none()
+        && !sets.first().is_some_and(|(_, p)| matched_at_zero(p))
+    {
         sets.extend(
             find_layouts(db, &sectors)
                 .into_iter()
@@ -334,16 +331,13 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
             .iter()
             .map(|&o| OffsetAccum::new(o, bounds.clone()))
             .collect();
-        for (k, track) in job.tracks.iter().enumerate() {
-            let mut pos = bounds[k];
-            let _ = decode::decode(&track.path, false, |frames| {
-                for a in accs.iter_mut() {
-                    a.push(pos, frames);
-                }
-                pos += frames.len() as u64;
-                progress((1.0 + pos as f32 / total * 0.5) / passes);
-            });
-        }
+        decode::decode_album(&job.tracks, false, |pos, frames| {
+            for a in accs.iter_mut() {
+                a.push(pos, frames);
+            }
+            let pos = pos + frames.len() as u64;
+            progress((1.0 + pos as f32 / total * 0.5) / passes);
+        });
         crcs.extend(accs.iter().map(|a| (a.offset, a.finish())));
     }
 
@@ -380,7 +374,7 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
         }
     }
     let mut data_first = false;
-    let mut real_layout = None;
+    let mut real_layout = image_layout(job);
     let best = match chosen {
         Some((layout, p, eval)) => {
             if let Some(m) = layout {
@@ -561,7 +555,7 @@ pub fn verify_ctdb_first(
     let (sectors, _) = identify(job, &mut result);
     let offsets = disc::audio_offsets(&sectors);
     let audio_end: u32 = sectors.iter().sum();
-    let layout = match ctdb_layout(db, &offsets, audio_end) {
+    let layout = match ctdb_layout(db, &offsets, audio_end, image_layout(job)) {
         Ok(Some(CtdbDisc::AudioOnly)) => None,
         Ok(Some(CtdbDisc::Layout(layout))) => Some(layout),
         // CTDB can't say: AccurateRip has the final word.
@@ -612,7 +606,8 @@ pub fn verify_ctdb_first(
         return (ar, Some((outcome, msg)));
     };
 
-    if let Some(layout) = layout {
+    // An image's layout comes from its CUE sheet: `identify` covered it.
+    if let Some(layout) = layout.filter(|_| image_layout(job).is_none()) {
         let (id, note) = layout_id(&sectors, layout);
         result.disc_id = Some(id.file_name());
         result.url = Some(id.url());
@@ -641,8 +636,18 @@ enum CtdbDisc {
     Layout(TocLayout),
 }
 
-/// How CTDB knows this disc, or `Ok(None)` if it doesn't.
-fn ctdb_layout(db: &Db, offsets: &[u32], audio_end: u32) -> Result<Option<CtdbDisc>> {
+/// How CTDB knows this disc, or `Ok(None)` if it doesn't. `known` is the
+/// layout from an image's CUE sheet, which is the only one tried.
+fn ctdb_layout(
+    db: &Db,
+    offsets: &[u32],
+    audio_end: u32,
+    known: Option<TocLayout>,
+) -> Result<Option<CtdbDisc>> {
+    if let Some(layout) = known {
+        let toc = db::ctdb_toc(offsets, audio_end, Some(layout));
+        return Ok(db::ctdb_repair_info(db, &toc)?.map(|_| CtdbDisc::Layout(layout)));
+    }
     let plain = db::ctdb_toc(offsets, audio_end, None);
     if db::ctdb_repair_info(db, &plain)?.is_some() {
         return Ok(Some(CtdbDisc::AudioOnly));

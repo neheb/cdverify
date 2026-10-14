@@ -301,7 +301,9 @@ impl App {
         self.repairing = true;
         self.message = Some(format!("Checking {title} against CTDB…"));
         std::thread::spawn(move || {
-            let tracks = paths.iter().map(|p| crate::scan::probe_track(p)).collect();
+            let mut files = paths.clone();
+            files.extend(crate::scan::cue_files_beside(&paths));
+            let tracks = crate::scan::probe_files(&files);
             let job = crate::scan::AlbumJob {
                 dir: dir.clone(),
                 title: title.clone(),

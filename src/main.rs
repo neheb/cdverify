@@ -5,6 +5,7 @@
 mod app;
 mod cache;
 mod crc;
+mod cue;
 mod db;
 mod decode;
 mod disc;
@@ -347,7 +348,7 @@ fn start(
                         .display()
                         .to_string();
                     let _ = tx.send(Event::Started { worker, label });
-                    let tracks = files.iter().map(|f| scan::probe_track(f)).collect();
+                    let tracks = scan::probe_files(&files);
                     let jobs = scan::group(&dir, tracks);
                     let n = jobs.len() as f32;
                     // A mode that is cached is reused album by album, if the

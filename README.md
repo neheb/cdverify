@@ -71,6 +71,7 @@ Options:
 ## How it works
 
 - **Albums.** Each folder of audio files is split into albums by its ALBUM and DISCNUMBER tags. Tracks are ordered by TRACKNUMBER, or by file name when that tag is missing. An album must be complete: tracks numbered 1..n, matching TRACKTOTAL when present.
+- **CD images.** A single file holding a whole disc is split into tracks by its CUE sheet: a FLAC `CUESHEET` block, a `CUESHEET` tag (foobar2000, CUETools), or a `.cue` file next to it that names it or shares its name. The sheet also gives any pregap before track 1 (hidden track one audio), so the disc ID needs no guessing for it. Repair writes a corrected copy of the whole image, keeping its metadata; copy an external `.cue` alongside it yourself.
 - **Disc ID.** The TOC is rebuilt from the track lengths, with track 1 at LBA 0. That gives the AccurateRip disc IDs and the `dBAR-…bin` URL.
 - **Checksums.** Each track's v1 and v2 checksums are computed and compared with every pressing in the database response.
 - **MusicBrainz.** The same TOC gives the MusicBrainz disc ID, shown as a `musicbrainz.org/cdtoc/…` link listing the releases with that TOC. A `MUSICBRAINZ_DISCID` tag that disagrees with it is flagged, which usually means a wrong or incomplete album grouping. A CD can be in AccurateRip but have no disc ID submitted to MusicBrainz.

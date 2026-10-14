@@ -326,8 +326,11 @@ fn start(
                     };
                     let hit = cached(false);
                     let other_hit = both.then(|| cached(true)).flatten();
-                    // With both modes wanted, only skip folders cached in both.
-                    if let Some(albums) = hit.clone().filter(|_| !both || other_hit.is_some()) {
+                    // This mode's cached results are enough. The other mode is
+                    // only filled in for folders that get scanned anyway: one
+                    // missing from the cache needs rechecking (e.g. an album
+                    // AccurateRip doesn't know), which is for a run in that mode.
+                    if let Some(albums) = hit.clone() {
                         let _ = tx.send(Event::Done {
                             worker,
                             dir,

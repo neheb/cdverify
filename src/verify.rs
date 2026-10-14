@@ -198,8 +198,9 @@ fn blank_result(job: &AlbumJob) -> AlbumResult {
     }
 }
 
-/// Track lengths in sectors of an eligible album; sets the audio-only disc IDs.
-fn identify(job: &AlbumJob, result: &mut AlbumResult) -> Vec<u32> {
+/// Track lengths in sectors of an eligible album and its audio-only
+/// AccurateRip ID; sets the audio-only disc IDs.
+fn identify(job: &AlbumJob, result: &mut AlbumResult) -> (Vec<u32>, DiscId) {
     let sectors: Vec<u32> = job
         .tracks
         .iter()
@@ -209,7 +210,7 @@ fn identify(job: &AlbumJob, result: &mut AlbumResult) -> Vec<u32> {
     result.disc_id = Some(id.file_name());
     result.url = Some(id.url());
     set_mb_id(job, result, &sectors, 0);
-    sectors
+    (sectors, id)
 }
 
 /// Sets the MusicBrainz disc ID for track 1 at `start`, flagging a differing tag.
@@ -230,7 +231,7 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
         result.reason = reason;
         return result;
     }
-    let sectors = identify(job, &mut result);
+    let (sectors, id) = identify(job, &mut result);
 
     if opts.use_tags {
         let tagged: Option<Vec<u32>> = job
@@ -256,7 +257,7 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
         }))
         .collect();
 
-    let lookup = db.lookup(&DiscId::from_track_sectors(&sectors));
+    let lookup = db.lookup(&id);
     let mut pressings = match &lookup {
         Ok(Some(p)) if !p.is_empty() => Some(p.clone()),
         _ => None,
@@ -540,7 +541,7 @@ pub fn verify_ctdb_first(
         result.reason = reason;
         return (result, None);
     }
-    let sectors = identify(job, &mut result);
+    let (sectors, _) = identify(job, &mut result);
     let offsets = disc::audio_offsets(&sectors);
     let audio_end: u32 = sectors.iter().sum();
     let layout = match ctdb_layout(db, &offsets, audio_end) {

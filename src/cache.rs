@@ -89,15 +89,16 @@ impl Cache {
         c
     }
 
-    fn entries(&self) -> &HashMap<PathBuf, Entry> {
-        match self.ctdb_first {
+    /// This mode's entries, or with `other` the other mode's.
+    fn entries(&self, other: bool) -> &HashMap<PathBuf, Entry> {
+        match self.ctdb_first != other {
             true => &self.inverted,
             false => &self.folders,
         }
     }
 
-    fn entries_mut(&mut self) -> &mut HashMap<PathBuf, Entry> {
-        match self.ctdb_first {
+    fn entries_mut(&mut self, other: bool) -> &mut HashMap<PathBuf, Entry> {
+        match self.ctdb_first != other {
             true => &mut self.inverted,
             false => &mut self.folders,
         }
@@ -116,21 +117,17 @@ impl Cache {
 
     /// Cached results for `dir` if its files still match `files`.
     pub fn get(&self, dir: &Path, files: &[FileStamp]) -> Option<Vec<AlbumResult>> {
-        get(self.entries(), dir, files)
+        get(self.entries(false), dir, files)
     }
 
     /// Like [`Cache::get`], for the other mode (`--both`).
     pub fn get_other(&self, dir: &Path, files: &[FileStamp]) -> Option<Vec<AlbumResult>> {
-        let other = match self.ctdb_first {
-            true => &self.folders,
-            false => &self.inverted,
-        };
-        get(other, dir, files)
+        get(self.entries(true), dir, files)
     }
 
     /// Records a folder's results, or forgets it if any album needs rechecking.
     pub fn update(&mut self, dir: PathBuf, files: Option<Vec<FileStamp>>, albums: &[AlbumResult]) {
-        update(self.entries_mut(), dir, files, albums);
+        update(self.entries_mut(false), dir, files, albums);
     }
 
     /// Like [`Cache::update`], for the other mode (`--both`).
@@ -140,11 +137,7 @@ impl Cache {
         files: Option<Vec<FileStamp>>,
         albums: &[AlbumResult],
     ) {
-        let other = match self.ctdb_first {
-            true => &mut self.folders,
-            false => &mut self.inverted,
-        };
-        update(other, dir, files, albums);
+        update(self.entries_mut(true), dir, files, albums);
     }
 }
 

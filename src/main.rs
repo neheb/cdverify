@@ -147,6 +147,31 @@ struct RepairOptions {
     check_all: bool,
 }
 
+/// Whether normal mode checks this album against CTDB's parity data.
+fn wants_repair(album: &verify::AlbumResult, ro: &RepairOptions) -> bool {
+    ro.check_all
+        || (album.verdict == verify::Verdict::RipErrors
+            && album.ctdb_known
+            && album.diagnosis.is_none())
+}
+
+/// Undoes [`maybe_repair`] on a cached result, so it can be reused as the
+/// AccurateRip half of an --invert check.
+fn without_repair(album: &verify::AlbumResult) -> verify::AlbumResult {
+    let mut album = album.clone();
+    if let Some(outcome) = album.repair_outcome.take() {
+        let note = format!("; {}", outcome.verdict_note());
+        if let Some(reason) = album.reason.strip_suffix(&note) {
+            album.reason = reason.to_string();
+        }
+        if outcome == repair::Outcome::Verified {
+            album.recheck = album.verdict != verify::Verdict::Accurate;
+        }
+    }
+    album.repair = None;
+    album
+}
+
 /// Checks albums with ripping errors against CTDB's parity data (every
 /// album with `check_all`), writing repaired copies when `--repair` is given.
 fn maybe_repair(
@@ -162,14 +187,10 @@ fn maybe_repair(
     if album.repair_outcome.is_some() {
         return;
     }
-    let wants = ro.check_all
-        || (album.verdict == verify::Verdict::RipErrors
-            && album.ctdb_known
-            && album.diagnosis.is_none());
     let Some(toc) = album.ctdb_toc.clone() else {
         return;
     };
-    if wants {
+    if wants_repair(album, ro) {
         let dest = ro
             .out
             .as_ref()
@@ -222,8 +243,11 @@ fn check_album(
     let (normal, inverted) = match (normal, inverted) {
         (Some(n), Some(i)) => (n, i),
         (Some(normal), None) => {
-            let inverted =
-                verify::verify_ctdb_first(job, db, opts, dest.as_deref(), None, progress).0;
+            // Only --invert itself writes repaired copies of a CTDB mismatch;
+            // in normal mode, maybe_repair already decided for this album.
+            let dest = dest.as_deref().filter(|_| opts.ctdb_first);
+            let ar = without_repair(&normal);
+            let inverted = verify::verify_ctdb_first(job, db, opts, dest, Some(&ar), progress).0;
             (normal, inverted)
         }
         (None, Some(inverted)) => {
@@ -250,6 +274,8 @@ fn check_both(
     progress: &mut dyn FnMut(f32),
 ) -> (verify::AlbumResult, verify::AlbumResult) {
     let mut normal = verify::verify(job, db, opts, &mut |f| progress(f / 2.0));
+    // In normal mode, write a repaired copy only if maybe_repair would.
+    let dest = dest.filter(|_| opts.ctdb_first || wants_repair(&normal, ro));
     let (inverted, checked) =
         verify::verify_ctdb_first(job, db, opts, dest, Some(&normal), &mut |f| {
             progress(0.5 + f / 2.0)

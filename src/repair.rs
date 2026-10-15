@@ -167,146 +167,203 @@ pub fn analyze(
     db: &Db,
     progress: &mut dyn FnMut(f32),
 ) -> Result<Analysis> {
-    let bounds = track_bounds(job)?;
-    let samples = *bounds.last().unwrap();
-    let entries = db::ctdb_exact(db, toc).context("CTDB lookup")?;
-    let stride_frames = entries.iter().find_map(|e| e.stride).unwrap_or(5880);
-    let geo = Geometry::new(samples, stride_frames * 2);
-
-    // Pass 1: parity, plus prefix CRCs around both ends of the CRC window for
-    // every offset the syndrome search can find (|offset| < stride / 2).
-    let reach = stride_frames as u64;
-    let (a0, b0) = parity::crc_window(geo, 0);
-    let mut windows = [
-        PrefixCrcs {
-            start: a0.saturating_sub(reach),
-            crcs: Vec::new(),
-        },
-        PrefixCrcs {
-            start: b0.saturating_sub(reach),
-            crcs: Vec::new(),
-        },
-    ];
-    let mut enc = ParityEncoder::new(geo);
-    let mut crc = Crc32::new();
-    let mut pos = 0u64;
+    let mut pass = Pass::new(job, toc, db)?;
     let notes = decode::decode_album(&job.tracks, false, |_, frames| {
-        enc.push(frames);
-        for &f in frames {
-            for w in windows.iter_mut() {
-                if pos >= w.start && pos < w.start + 2 * reach + 1 {
-                    w.crcs.push(crc.value());
-                }
-            }
-            crc.update(&f.to_le_bytes());
-            pos += 1;
-        }
-        progress(pos as f32 / samples as f32);
+        pass.push(frames);
+        progress(pass.pos as f32 / pass.samples as f32);
     });
-    if let Some((k, note)) = notes
-        .iter()
-        .enumerate()
-        .find_map(|(k, n)| n.as_ref().map(|n| (k, n)))
-    {
-        bail!("track {}: {note}", k + 1);
-    }
-    for w in windows.iter_mut() {
-        if pos >= w.start && pos < w.start + 2 * reach + 1 {
-            w.crcs.push(crc.value());
-        }
-    }
-    let prefix = |p: u64| -> Option<u32> {
-        windows.iter().find_map(|w| {
-            p.checked_sub(w.start)
-                .and_then(|i| w.crcs.get(i as usize).copied())
-        })
-    };
-    // CRC32 of our rip over CTDB's window at `offset`, after `fixes`.
-    let window_crc = |offset: i64, fixes: &[Fix]| -> Option<u32> {
-        let (a, b) = parity::crc_window(geo, offset);
-        let mut c = prefix(b)? ^ crc32_shift(prefix(a)?, (b - a) * 4);
-        for f in fixes {
-            let end = (f.word as u64 + 1) * 2;
-            let raw = crc32_raw(0, &f.diff.to_le_bytes());
-            c ^= crc32_shift(raw, b * 4 - end);
-        }
-        Some(c)
-    };
+    pass.finish(&notes, db)
+}
 
-    let mut statuses = Vec::new();
-    let mut plan: Option<(u32, i64, Vec<Fix>)> = None;
-    for e in &entries {
-        let conf = e.confidence;
-        let not = |reason: &str| EntryStatus::NotRepairable {
-            confidence: conf,
-            reason: reason.into(),
-        };
-        if e.stride != Some(stride_frames) {
-            statuses.push(not("different parity stride"));
-            continue;
+/// One decode's worth of CTDB checking: parity, plus prefix CRCs around both
+/// ends of the CRC window for every offset the syndrome search can find
+/// (|offset| < stride / 2). Fed by [`analyze`], or by AccurateRip's decode
+/// so that one decode serves both checks.
+pub struct Pass {
+    entries: Vec<CtdbEntry>,
+    stride_frames: usize,
+    geo: Geometry,
+    reach: u64,
+    windows: [PrefixCrcs; 2],
+    enc: ParityEncoder,
+    crc: Crc32,
+    pos: u64,
+    samples: u64,
+    bounds: Arc<[u64]>,
+}
+
+impl Pass {
+    /// Looks up CTDB's entries for `toc`, ready to be fed the album.
+    pub fn new(job: &AlbumJob, toc: &str, db: &Db) -> Result<Pass> {
+        let bounds = track_bounds(job)?;
+        let samples = *bounds.last().unwrap();
+        let entries = db::ctdb_exact(db, toc).context("CTDB lookup")?;
+        let stride_frames = entries.iter().find_map(|e| e.stride).unwrap_or(5880);
+        let geo = Geometry::new(samples, stride_frames * 2);
+        let reach = stride_frames as u64;
+        let (a0, b0) = parity::crc_window(geo, 0);
+        let windows = [
+            PrefixCrcs {
+                start: a0.saturating_sub(reach),
+                crcs: Vec::new(),
+            },
+            PrefixCrcs {
+                start: b0.saturating_sub(reach),
+                crcs: Vec::new(),
+            },
+        ];
+        Ok(Pass {
+            entries,
+            stride_frames,
+            geo,
+            reach,
+            windows,
+            enc: ParityEncoder::new(geo),
+            crc: Crc32::new(),
+            pos: 0,
+            samples,
+            bounds,
+        })
+    }
+
+    /// Feeds the album's next frames, in order from its first.
+    pub fn push(&mut self, frames: &[u32]) {
+        self.enc.push(frames);
+        for &f in frames {
+            self.mark();
+            self.crc.update(&f.to_le_bytes());
+            self.pos += 1;
         }
-        let Some(head) = entry_syndrome(e) else {
-            statuses.push(not("no syndrome"));
-            continue;
-        };
-        let Some((offset, exact)) = parity::find_offset(&enc, &head) else {
-            statuses.push(not("too different from this rip"));
-            continue;
-        };
-        if exact && window_crc(offset, &[]) == e.crc32 {
-            statuses.push(EntryStatus::Verified {
-                confidence: conf,
-                offset,
-            });
-            continue;
-        }
-        let Some(url) = &e.parity_url else {
-            statuses.push(not("differs, and CTDB has no repair data for it"));
-            continue;
-        };
-        let npar = e.npar.unwrap_or(MAX_NPAR).min(MAX_NPAR);
-        let bytes = db::fetch(db, url).context("downloading CTDB parity")?;
-        let Some(full) = parity::bytes_to_syndrome(geo.stride, npar, &bytes) else {
-            statuses.push(not("parity file too short"));
-            continue;
-        };
-        if full[..npar] != head[..] {
-            statuses.push(not("parity file doesn't match its entry"));
-            continue;
-        }
-        match parity::compute_fixes(&enc, &full, npar, offset) {
-            None => statuses.push(not("too much damage for the repair data")),
-            Some(fixes) if window_crc(offset, &fixes) != e.crc32 => {
-                statuses.push(not("corrected audio fails CTDB's CRC check"))
+    }
+
+    /// Records the CRC of the prefix ending here if a window wants it.
+    fn mark(&mut self) {
+        let span = 2 * self.reach + 1;
+        for w in self.windows.iter_mut() {
+            if self.pos >= w.start && self.pos < w.start + span {
+                w.crcs.push(self.crc.value());
             }
-            Some(fixes) => {
-                let tracks = affected_tracks(&bounds, &fixes);
-                let samples = fixes.len();
-                statuses.push(EntryStatus::Repairable {
+        }
+    }
+
+    /// Checks the fed album against each entry, given the decode's notes on
+    /// damaged tracks. An MD5 mismatch alone doesn't stop the check: the
+    /// audio still decoded in full.
+    pub fn finish(mut self, notes: &[Option<String>], db: &Db) -> Result<Analysis> {
+        if let Some((k, note)) = notes.iter().enumerate().find_map(|(k, n)| {
+            n.as_ref()
+                .filter(|n| *n != decode::MD5_MISMATCH)
+                .map(|n| (k, n))
+        }) {
+            bail!("track {}: {note}", k + 1);
+        }
+        self.mark();
+        self.check(db)
+    }
+
+    fn check(self, db: &Db) -> Result<Analysis> {
+        let Pass {
+            entries,
+            stride_frames,
+            geo,
+            windows,
+            enc,
+            bounds,
+            ..
+        } = self;
+        let prefix = |p: u64| -> Option<u32> {
+            windows.iter().find_map(|w| {
+                p.checked_sub(w.start)
+                    .and_then(|i| w.crcs.get(i as usize).copied())
+            })
+        };
+        // CRC32 of our rip over CTDB's window at `offset`, after `fixes`.
+        let window_crc = |offset: i64, fixes: &[Fix]| -> Option<u32> {
+            let (a, b) = parity::crc_window(geo, offset);
+            let mut c = prefix(b)? ^ crc32_shift(prefix(a)?, (b - a) * 4);
+            for f in fixes {
+                let end = (f.word as u64 + 1) * 2;
+                let raw = crc32_raw(0, &f.diff.to_le_bytes());
+                c ^= crc32_shift(raw, b * 4 - end);
+            }
+            Some(c)
+        };
+
+        let mut statuses = Vec::new();
+        let mut plan: Option<(u32, i64, Vec<Fix>)> = None;
+        for e in &entries {
+            let conf = e.confidence;
+            let not = |reason: &str| EntryStatus::NotRepairable {
+                confidence: conf,
+                reason: reason.into(),
+            };
+            if e.stride != Some(stride_frames) {
+                statuses.push(not("different parity stride"));
+                continue;
+            }
+            let Some(head) = entry_syndrome(e) else {
+                statuses.push(not("no syndrome"));
+                continue;
+            };
+            let Some((offset, exact)) = parity::find_offset(&enc, &head) else {
+                statuses.push(not("too different from this rip"));
+                continue;
+            };
+            if exact && window_crc(offset, &[]) == e.crc32 {
+                statuses.push(EntryStatus::Verified {
                     confidence: conf,
                     offset,
-                    samples,
-                    tracks,
                 });
-                if plan.as_ref().is_none_or(|p| conf > p.0) {
-                    plan = Some((conf, offset, fixes));
+                continue;
+            }
+            let Some(url) = &e.parity_url else {
+                statuses.push(not("differs, and CTDB has no repair data for it"));
+                continue;
+            };
+            let npar = e.npar.unwrap_or(MAX_NPAR).min(MAX_NPAR);
+            let bytes = db::fetch(db, url).context("downloading CTDB parity")?;
+            let Some(full) = parity::bytes_to_syndrome(geo.stride, npar, &bytes) else {
+                statuses.push(not("parity file too short"));
+                continue;
+            };
+            if full[..npar] != head[..] {
+                statuses.push(not("parity file doesn't match its entry"));
+                continue;
+            }
+            match parity::compute_fixes(&enc, &full, npar, offset) {
+                None => statuses.push(not("too much damage for the repair data")),
+                Some(fixes) if window_crc(offset, &fixes) != e.crc32 => {
+                    statuses.push(not("corrected audio fails CTDB's CRC check"))
+                }
+                Some(fixes) => {
+                    let tracks = affected_tracks(&bounds, &fixes);
+                    let samples = fixes.len();
+                    statuses.push(EntryStatus::Repairable {
+                        confidence: conf,
+                        offset,
+                        samples,
+                        tracks,
+                    });
+                    if plan.as_ref().is_none_or(|p| conf > p.0) {
+                        plan = Some((conf, offset, fixes));
+                    }
                 }
             }
         }
+        // A rip that exactly matches one entry is that version of the disc;
+        // "repairing" it toward another entry would rewrite correct audio.
+        if statuses
+            .iter()
+            .any(|s| matches!(s, EntryStatus::Verified { .. }))
+        {
+            plan = None;
+        }
+        Ok(Analysis {
+            statuses,
+            plan,
+            bounds,
+        })
     }
-    // A rip that exactly matches one entry is that version of the disc;
-    // "repairing" it toward another entry would rewrite correct audio.
-    if statuses
-        .iter()
-        .any(|s| matches!(s, EntryStatus::Verified { .. }))
-    {
-        plan = None;
-    }
-    Ok(Analysis {
-        statuses,
-        plan,
-        bounds,
-    })
 }
 
 /// The entry's first-column syndrome (`npar` words).

@@ -59,6 +59,9 @@ pub fn open(path: &Path, verify: bool) -> Result<Opened> {
     })
 }
 
+/// [`decode_album`]'s note for a track whose FLAC MD5 doesn't match its audio.
+pub const MD5_MISMATCH: &str = "MD5 mismatch";
+
 pub struct Decoded {
     pub frames: u64,
     /// `Some(false)` when the stream's embedded checksum (FLAC MD5) mismatched.
@@ -152,7 +155,7 @@ pub fn decode_album(
         let expected = skip + len;
         let (first, note) = match outcome {
             Err(e) => (from(file_pos), Some(format!("decode error: {e}"))),
-            Ok(d) if d.verify_ok == Some(false) => (0, Some("MD5 mismatch".into())),
+            Ok(d) if d.verify_ok == Some(false) => (0, Some(MD5_MISMATCH.into())),
             Ok(d) if d.frames != expected => {
                 let note = match end - k {
                     1 => format!("decoded {} frames, expected {}", d.frames, len),

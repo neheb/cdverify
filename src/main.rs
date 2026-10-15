@@ -231,7 +231,9 @@ fn check_album(
         .map(|o| repair::destination(o, root, &job.dir));
     if !both {
         let mut album = match opts.ctdb_first {
-            true => verify::verify_ctdb_first(job, db, opts, dest.as_deref(), None, progress).0,
+            true => {
+                verify::verify_ctdb_first(job, db, opts, dest.as_deref(), None, None, progress).0
+            }
             false => verify::verify(job, db, opts, progress),
         };
         maybe_repair(&mut album, job, root, db, ro, None, progress);
@@ -248,7 +250,8 @@ fn check_album(
             // in normal mode, maybe_repair already decided for this album.
             let dest = dest.as_deref().filter(|_| opts.ctdb_first);
             let ar = without_repair(&normal);
-            let inverted = verify::verify_ctdb_first(job, db, opts, dest, Some(&ar), progress).0;
+            let inverted =
+                verify::verify_ctdb_first(job, db, opts, dest, Some(&ar), None, progress).0;
             (normal, inverted)
         }
         (None, Some(inverted)) => {
@@ -274,11 +277,13 @@ fn check_both(
     ro: &RepairOptions,
     progress: &mut dyn FnMut(f32),
 ) -> (verify::AlbumResult, verify::AlbumResult) {
-    let mut normal = verify::verify(job, db, opts, &mut |f| progress(f / 2.0));
+    // CTDB's parity pass shares AccurateRip's first decode.
+    let mut prep = verify::CtdbPrep::new(job, db);
+    let mut normal = verify::verify_with(job, db, opts, prep.as_mut(), &mut |f| progress(f / 2.0));
     // In normal mode, write a repaired copy only if maybe_repair would.
     let dest = dest.filter(|_| opts.ctdb_first || wants_repair(&normal, ro));
     let (inverted, checked) =
-        verify::verify_ctdb_first(job, db, opts, dest, Some(&normal), &mut |f| {
+        verify::verify_ctdb_first(job, db, opts, dest, Some(&normal), prep, &mut |f| {
             progress(0.5 + f / 2.0)
         });
     // Normal mode's CTDB check is the same one if it's for the same TOC.

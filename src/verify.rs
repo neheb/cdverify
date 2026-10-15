@@ -201,16 +201,20 @@ fn blank_result(job: &AlbumJob) -> AlbumResult {
 /// Track lengths in sectors of an eligible album and its AccurateRip ID
 /// (audio-only, or with a CD image's pregap); sets the disc IDs.
 fn identify(job: &AlbumJob, result: &mut AlbumResult) -> (Vec<u32>, DiscId) {
-    let sectors: Vec<u32> = job
-        .tracks
-        .iter()
-        .map(|t| (t.frames.unwrap() / SECTOR_FRAMES) as u32)
-        .collect();
+    let sectors = track_sectors(job);
     let id = DiscId::with_pregap(&sectors, job.pregap());
     result.disc_id = Some(id.file_name());
     result.url = Some(id.url());
     set_mb_id(job, result, &sectors, job.pregap());
     (sectors, id)
+}
+
+/// Track lengths in sectors of an eligible album.
+fn track_sectors(job: &AlbumJob) -> Vec<u32> {
+    job.tracks
+        .iter()
+        .map(|t| (t.frames.unwrap() / SECTOR_FRAMES) as u32)
+        .collect()
 }
 
 /// The layout a CD image's CUE sheet gives: a pregap before track 1.
@@ -232,6 +236,17 @@ fn set_mb_id(job: &AlbumJob, result: &mut AlbumResult, sectors: &[u32], start: u
 }
 
 pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -> AlbumResult {
+    verify_with(job, db, opts, None, progress)
+}
+
+/// [`verify`], also feeding `ctdb` its first decode of the album.
+pub fn verify_with(
+    job: &AlbumJob,
+    db: &Db,
+    opts: &Options,
+    mut ctdb: Option<&mut CtdbPrep>,
+    progress: Progress<'_>,
+) -> AlbumResult {
     let mut result = blank_result(job);
     if let Err(reason) = check_eligible(job) {
         result.reason = reason;
@@ -277,8 +292,14 @@ pub fn verify(job: &AlbumJob, db: &Db, opts: &Options, progress: Progress<'_>) -
     let notes = decode::decode_album(&job.tracks, true, |pos, frames| {
         acc0.push(pos, frames);
         windows.push(pos, frames);
+        if let Some(Ok(pass)) = ctdb.as_mut().and_then(|c| c.pass.as_mut()) {
+            pass.push(frames);
+        }
         progress((pos + frames.len() as u64) as f32 / total / passes);
     });
+    if let Some(c) = ctdb {
+        c.notes = Some(notes.clone());
+    }
     let mut corrupted = vec![false; job.tracks.len()];
     for (k, note) in notes.into_iter().enumerate() {
         if let Some(note) = note {
@@ -537,13 +558,14 @@ fn accuraterip(
 /// AccurateRip only about albums that don't match it, reusing `ar` (a
 /// [`verify`] result) if given. `dest` is where repaired copies go
 /// (`--repair`). Also returns the CTDB check's outcome and description, if
-/// it ran.
+/// it ran. `prep`, from [`CtdbPrep::new`], saves a decode if it was fed one.
 pub fn verify_ctdb_first(
     job: &AlbumJob,
     db: &Db,
     opts: &Options,
     dest: Option<&Path>,
     ar: Option<&AlbumResult>,
+    prep: Option<CtdbPrep>,
     progress: Progress<'_>,
 ) -> (AlbumResult, Option<(Outcome, String)>) {
     let mut result = blank_result(job);
@@ -553,11 +575,9 @@ pub fn verify_ctdb_first(
         return (result, None);
     }
     let (sectors, _) = identify(job, &mut result);
-    let offsets = disc::audio_offsets(&sectors);
-    let audio_end: u32 = sectors.iter().sum();
-    let layout = match ctdb_layout(db, &offsets, audio_end, image_layout(job)) {
-        Ok(Some(CtdbDisc::AudioOnly)) => None,
-        Ok(Some(CtdbDisc::Layout(layout))) => Some(layout),
+    let prep = prep.unwrap_or_else(|| CtdbPrep::lookup(job, db));
+    let layout = match prep.layout {
+        Ok(Some(disc)) => disc.layout(),
         // CTDB can't say: AccurateRip has the final word.
         Ok(None) => {
             let mut ar = accuraterip(job, db, opts, ar, progress);
@@ -573,8 +593,12 @@ pub fn verify_ctdb_first(
             return (ar, None);
         }
     };
-    let toc = db::ctdb_toc(&offsets, audio_end, layout);
-    let analysis = repair::analyze(job, &toc, db, progress);
+    let toc = ctdb_toc(&sectors, layout);
+    let analysis = match (prep.pass, prep.notes) {
+        (Some(Ok(pass)), Some(notes)) => pass.finish(&notes, db),
+        (Some(Err(e)), _) => Err(e),
+        _ => repair::analyze(job, &toc, db, progress),
+    };
     let Some((confidence, offset)) = analysis.as_ref().ok().and_then(|a| a.verified()) else {
         let (outcome, msg) = match &analysis {
             Ok(a) => repair::finish(job, a, dest),
@@ -628,12 +652,61 @@ pub fn verify_ctdb_first(
     (result, Some((Outcome::Verified, msg)))
 }
 
+/// The CTDB half of an album's check, looked up before AccurateRip's decode
+/// so that the same decode can feed CTDB's parity pass.
+pub struct CtdbPrep {
+    layout: Result<Option<CtdbDisc>>,
+    pass: Option<Result<repair::Pass>>,
+    /// The decode's notes on damaged tracks, once `pass` has been fed.
+    notes: Option<Vec<Option<String>>>,
+}
+
+impl CtdbPrep {
+    /// Looks the album up in CTDB, ready to be fed a decode if CTDB knows
+    /// the disc. `None` for an album that can't be checked.
+    pub fn new(job: &AlbumJob, db: &Db) -> Option<CtdbPrep> {
+        check_eligible(job).ok()?;
+        let mut prep = CtdbPrep::lookup(job, db);
+        if let Ok(Some(disc)) = &prep.layout {
+            let toc = ctdb_toc(&track_sectors(job), disc.layout());
+            prep.pass = Some(repair::Pass::new(job, &toc, db));
+        }
+        Some(prep)
+    }
+
+    /// The lookup alone, for an eligible album.
+    fn lookup(job: &AlbumJob, db: &Db) -> CtdbPrep {
+        let sectors = track_sectors(job);
+        let offsets = disc::audio_offsets(&sectors);
+        let audio_end: u32 = sectors.iter().sum();
+        CtdbPrep {
+            layout: ctdb_layout(db, &offsets, audio_end, image_layout(job)),
+            pass: None,
+            notes: None,
+        }
+    }
+}
+
+/// CTDB's TOC for an album's tracks laid out as `layout`.
+fn ctdb_toc(sectors: &[u32], layout: Option<TocLayout>) -> String {
+    db::ctdb_toc(&disc::audio_offsets(sectors), sectors.iter().sum(), layout)
+}
+
 /// How CTDB knows a disc.
 enum CtdbDisc {
     /// By the audio tracks alone.
     AudioOnly,
     /// With a layout the audio files don't reveal (data track, pregap).
     Layout(TocLayout),
+}
+
+impl CtdbDisc {
+    fn layout(&self) -> Option<TocLayout> {
+        match self {
+            CtdbDisc::AudioOnly => None,
+            CtdbDisc::Layout(layout) => Some(*layout),
+        }
+    }
 }
 
 /// How CTDB knows this disc, or `Ok(None)` if it doesn't. `known` is the

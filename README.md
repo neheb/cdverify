@@ -22,7 +22,7 @@ Each [release](../../releases) has static binaries (no dependencies):
 |---------|-----|
 | `linux-amd64` | 64-bit x86 PCs |
 | `linux-armv6` | Raspberry Pi 1 / Zero |
-| `linux-armv7` | 32-bit ARMv7 (Raspberry Pi 2, 32-bit OS on Pi 3/4, most 32-bit ARM boards and NASes) |
+| `linux-armv7` | 32-bit ARMv7 with NEON (Raspberry Pi 2, 32-bit OS on Pi 3/4, most 32-bit ARM boards and NASes) |
 | `linux-aarch64` | 64-bit ARM (Raspberry Pi 3/4/5, ARM servers) |
 | `windows-x64` | 64-bit Windows 10/11 (`.zip`) |
 

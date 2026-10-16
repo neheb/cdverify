@@ -40,11 +40,15 @@ jobs:
             target: arm-unknown-linux-musleabihf
           - arch: armv7
             target: armv7-unknown-linux-musleabihf
+            # NEON vectorizes the CTDB parity pass. Rust calls the flag
+            # unstable but it works; only NEON-less chips (Tegra 2) miss out.
+            rustflags: -C target-feature=+neon
           - arch: aarch64
             target: aarch64-unknown-linux-musl
     env:
       ARCH: ${{ matrix.arch }}
       TARGET: ${{ matrix.target }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
       CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABIHF_LINKER: rust-lld
       CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: rust-lld

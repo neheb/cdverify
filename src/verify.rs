@@ -284,18 +284,49 @@ pub fn verify_with(
         _ => None,
     };
 
-    // Pass 1: offset 0, MD5 verification and frame-450 windows.
+    // Pass 1: offset 0, MD5 verification and frame-450 windows. Once the
+    // first tracks' windows are in, their likely pressing offsets get
+    // checksums too, replaying the frames buffered until then, so that the
+    // album usually needs no second decode.
     let mut acc0 = OffsetAccum::new(0, bounds.clone());
     let mut windows = Frame450Windows::new(opts.offset_range, &bounds);
+    let mut early: Vec<OffsetAccum> = Vec::new();
+    let mut buffer: Option<Vec<u32>> = pressings.as_ref().map(|_| Vec::new());
+    let mut ready = 0;
     let total = *bounds.last().unwrap() as f32;
-    let passes = 1.5;
     let notes = decode::decode_album(&job.tracks, true, |pos, frames| {
         acc0.push(pos, frames);
         windows.push(pos, frames);
         if let Some(Ok(pass)) = ctdb.as_mut().and_then(|c| c.pass.as_mut()) {
             pass.push(frames);
         }
-        progress((pos + frames.len() as u64) as f32 / total / passes);
+        for a in early.iter_mut() {
+            a.push(pos, frames);
+        }
+        if let (Some(buf), Some(p)) = (buffer.as_mut(), pressings.as_deref()) {
+            buf.extend_from_slice(frames);
+            let end = pos + frames.len() as u64;
+            let before = ready;
+            while ready < windows.tracks() && windows.end(ready) <= end {
+                ready += 1;
+            }
+            let offsets = match ready > before {
+                true => candidate_offsets(p, &windows, ready, opts.max_candidates),
+                false => Vec::new(),
+            };
+            if !offsets.is_empty() || ready == windows.tracks() || buf.len() > EARLY_BUFFER {
+                early = offsets
+                    .into_iter()
+                    .map(|o| {
+                        let mut a = OffsetAccum::new(o, bounds.clone());
+                        a.push(0, buf);
+                        a
+                    })
+                    .collect();
+                buffer = None;
+            }
+        }
+        progress((pos + frames.len() as u64) as f32 / total);
     });
     if let Some(c) = ctdb {
         c.notes = Some(notes.clone());
@@ -336,28 +367,36 @@ pub fn verify_with(
         );
     }
 
-    // Pass 2: checksums at every pressing offset that some candidate's
-    // frame-450 checksums point to, all in one more decode.
+    // Checksums at every pressing offset that some candidate's frame-450
+    // checksums point to. Pass 1 usually covered them; the rest take one
+    // more decode.
     let mut offsets: Vec<i64> = Vec::new();
     for (_, p) in sets.iter().filter(|(_, p)| !matched_at_zero(p)) {
-        for o in candidate_offsets(p, &windows, opts.max_candidates) {
+        for o in candidate_offsets(p, &windows, windows.tracks(), opts.max_candidates) {
             if !offsets.contains(&o) {
                 offsets.push(o);
             }
         }
     }
     let mut crcs: Vec<(i64, Vec<TrackCrc>)> = vec![(0, crc0)];
-    if !offsets.is_empty() {
-        let mut accs: Vec<OffsetAccum> = offsets
+    crcs.extend(
+        early
             .iter()
-            .map(|&o| OffsetAccum::new(o, bounds.clone()))
-            .collect();
+            .filter(|a| offsets.contains(&a.offset))
+            .map(|a| (a.offset, a.finish())),
+    );
+    let mut accs: Vec<OffsetAccum> = offsets
+        .iter()
+        .filter(|o| !early.iter().any(|a| a.offset == **o))
+        .map(|&o| OffsetAccum::new(o, bounds.clone()))
+        .collect();
+    if !accs.is_empty() {
+        progress(0.0);
         decode::decode_album(&job.tracks, false, |pos, frames| {
             for a in accs.iter_mut() {
                 a.push(pos, frames);
             }
-            let pos = pos + frames.len() as u64;
-            progress((1.0 + pos as f32 / total * 0.5) / passes);
+            progress((pos + frames.len() as u64) as f32 / total);
         });
         crcs.extend(accs.iter().map(|a| (a.offset, a.finish())));
     }
@@ -940,12 +979,24 @@ fn find_match(k: usize, crc: &TrackCrc, pressings: Option<&[Pressing]>) -> Match
     }
 }
 
-/// Offsets (other than 0) at which some track's frame-450 checksum matches the
-/// database, most frequently matching first.
-fn candidate_offsets(pressings: &[Pressing], w: &Frame450Windows, max: usize) -> Vec<i64> {
+/// Frames pass 1 buffers at most while waiting for likely pressing offsets
+/// (8 MB, about 48 seconds). Track 1's frame-450 window ends 6 seconds in.
+const EARLY_BUFFER: usize = 2 << 20;
+
+/// Offsets (other than 0) at which the frame-450 checksum of one of the first
+/// `tracks` tracks matches the database, most frequently matching first.
+fn candidate_offsets(
+    pressings: &[Pressing],
+    w: &Frame450Windows,
+    tracks: usize,
+    max: usize,
+) -> Vec<i64> {
     let range = w.range();
     let mut hits = vec![0u32; 2 * range as usize + 1];
-    let ntracks = pressings.first().map_or(0, |p| p.entries.len());
+    let ntracks = pressings
+        .first()
+        .map_or(0, |p| p.entries.len())
+        .min(tracks);
     for k in 0..ntracks {
         let targets: Vec<u32> = pressings
             .iter()

@@ -260,72 +260,117 @@ impl Geometry {
     }
 }
 
+type EncodeTable = [[[u16; MAX_NPAR]; 2]; 256];
+
+/// The encode table rotated for each possible register rotation:
+/// `[h][b][i][j]` is `encode_table()[b][i][(j - h - 1) % MAX_NPAR]`.
+fn rotated_tables() -> &'static [EncodeTable] {
+    static T: OnceLock<Vec<EncodeTable>> = OnceLock::new();
+    T.get_or_init(|| {
+        let table = Galois::get().encode_table();
+        (0..MAX_NPAR)
+            .map(|h| {
+                std::array::from_fn(|b| {
+                    std::array::from_fn(|i| {
+                        std::array::from_fn(|j| table[b][i][(j + MAX_NPAR - h - 1) % MAX_NPAR])
+                    })
+                })
+            })
+            .collect()
+    })
+}
+
 /// Accumulates CTDB parity while the album streams through.
+///
+/// Each column's register shifts by one word per update. All columns are
+/// updated once per stride, so instead of shifting, the registers are stored
+/// rotated by the number of updates they've had, and each stride's updates
+/// use the table rotated to match. That leaves a plain load-xor-store,
+/// without the lane shuffles that are slow on 32-bit ARM.
 pub struct ParityEncoder {
     geo: Geometry,
-    table: Vec<[[u16; MAX_NPAR]; 2]>,
-    /// `stride` registers of `MAX_NPAR` words.
+    /// `stride` registers of `MAX_NPAR` words, rotated as above.
     parity: Vec<u16>,
+    /// [`ParityEncoder::registers`], once worked out.
+    unrotated: OnceLock<Vec<u16>>,
     leadin: Vec<u16>,
     leadout: Vec<u16>,
     pos: usize,
-    /// `pos % stride`, kept as a counter: 32-bit ARM has no divide instruction.
-    col: usize,
 }
 
 impl ParityEncoder {
     pub fn new(geo: Geometry) -> ParityEncoder {
         ParityEncoder {
             geo,
-            table: Galois::get().encode_table(),
             parity: vec![0; geo.stride * MAX_NPAR],
+            unrotated: OnceLock::new(),
             leadin: vec![0; (geo.stride * 2).max(4096 * 4)],
             leadout: vec![0; (geo.stride + geo.laststride).max(4096 * 4)],
             pos: 0,
-            col: 0,
         }
     }
 
     /// Feeds stereo frames packed as `left | right << 16`, in order.
     pub fn push(&mut self, frames: &[u32]) {
         let geo = self.geo;
-        let lo_end = geo.stride;
-        let hi_end = geo.stride * (geo.stridecount + 1);
-        for &f in frames {
-            for word in [f as u16, (f >> 16) as u16] {
-                let w = self.pos;
-                if w < self.leadin.len() {
-                    self.leadin[w] = word;
-                }
-                if w < geo.words {
-                    let r = geo.words - 1 - w;
-                    if r < self.leadout.len() {
-                        self.leadout[r] = word;
-                    }
-                }
-                if w >= lo_end && w < hi_end {
-                    let at = self.col * MAX_NPAR;
-                    let reg: &mut [u16; MAX_NPAR] =
-                        (&mut self.parity[at..at + MAX_NPAR]).try_into().unwrap();
-                    let fb = reg[0] ^ word;
-                    let t0 = &self.table[(fb & 0xff) as usize][0];
-                    let t1 = &self.table[(fb >> 8) as usize][1];
-                    // Shift the register by one word, then add the feedback.
-                    // Whole fixed-size arrays let the compiler vectorize this.
-                    let mut next = [0u16; MAX_NPAR];
-                    next[..MAX_NPAR - 1].copy_from_slice(&reg[1..]);
-                    for k in 0..MAX_NPAR {
-                        next[k] ^= t0[k] ^ t1[k];
-                    }
-                    *reg = next;
-                }
-                self.pos += 1;
-                self.col += 1;
-                if self.col == geo.stride {
-                    self.col = 0;
-                }
-            }
+        let w0 = self.pos;
+        let w1 = w0 + frames.len() * 2;
+        self.pos = w1;
+        self.unrotated.take();
+        let word = |w: usize| (frames[(w - w0) / 2] >> ((w - w0) % 2 * 16)) as u16;
+        for w in w0..w1.min(self.leadin.len()) {
+            self.leadin[w] = word(w);
         }
+        for w in w0.max(geo.words.saturating_sub(self.leadout.len()))..w1.min(geo.words) {
+            self.leadout[geo.words - 1 - w] = word(w);
+        }
+        // Words in strides 1..=stridecount, word `w` going to column
+        // `w % stride`, one stride at a time.
+        let (mut w, b) = (w0.max(geo.stride), w1.min(geo.stride * (geo.stridecount + 1)));
+        while w < b {
+            let row = w / geo.stride;
+            let end = b.min((row + 1) * geo.stride);
+            // The registers' first word is at `h`; it's replaced by the last.
+            let h = (row - 1) % MAX_NPAR;
+            // Through black_box so that it stays in registers rather than
+            // being rebuilt for every word.
+            let keep: [u16; MAX_NPAR] =
+                std::hint::black_box(std::array::from_fn(|j| if j == h { 0 } else { !0 }));
+            let rot = &rotated_tables()[h];
+            let regs = self.parity[(w - row * geo.stride) * MAX_NPAR..]
+                .as_chunks_mut::<MAX_NPAR>()
+                .0;
+            for (reg, w) in regs.iter_mut().zip(w..end) {
+                let fb = reg[h] ^ word(w);
+                let t = &rot[(fb & 0xff) as usize][0];
+                let u = &rot[(fb >> 8) as usize][1];
+                let r = *reg;
+                *reg = std::array::from_fn(|j| (r[j] & keep[j]) ^ t[j] ^ u[j]);
+            }
+            w = end;
+        }
+    }
+
+    /// The parity registers, unrotated: register `c` in words
+    /// `c * MAX_NPAR..(c + 1) * MAX_NPAR`.
+    fn registers(&self) -> &[u16] {
+        self.unrotated.get_or_init(|| self.unrotate())
+    }
+
+    fn unrotate(&self) -> Vec<u16> {
+        let geo = self.geo;
+        // Updates every register has had, plus one for those fed in a
+        // partial stride.
+        let fed = self.pos.min(geo.stride * (geo.stridecount + 1));
+        let fed = fed.saturating_sub(geo.stride);
+        let (rows, extra) = (fed / geo.stride, fed % geo.stride);
+        let mut out = vec![0u16; self.parity.len()];
+        let regs = self.parity.as_chunks::<MAX_NPAR>().0;
+        for (c, (o, r)) in out.as_chunks_mut::<MAX_NPAR>().0.iter_mut().zip(regs).enumerate() {
+            let n = (rows + (c < extra) as usize) % MAX_NPAR;
+            *o = std::array::from_fn(|k| r[(k + n) % MAX_NPAR]);
+        }
+        out
     }
 
     /// Syndromes of the first `strides` columns as if the rip were shifted
@@ -334,7 +379,7 @@ impl ParityEncoder {
         let g = Galois::get();
         let geo = self.geo;
         let s = geo.stride as i64;
-        let mut syn = parity_to_syndrome(strides, geo.stride, npar, &self.parity, -offset * 2);
+        let mut syn = parity_to_syndrome(strides, geo.stride, npar, self.registers(), -offset * 2);
         for part2 in 0..strides {
             let part = (part2 as i64 + offset * 2 + s).rem_euclid(s);
             let row = &mut syn[part2 * npar..(part2 + 1) * npar];
@@ -545,6 +590,30 @@ mod tests {
             enc.push(chunk);
         }
         enc
+    }
+
+    #[test]
+    fn registers_match_shift_register() {
+        let table = Galois::get().encode_table();
+        let stride = 40;
+        // 37 strides of parity: not a whole number of register rotations.
+        let frames = noise(stride / 2 * 39 + 7, 11);
+        let geo = Geometry::new(frames.len() as u64, stride);
+        let mut want = vec![[0u16; MAX_NPAR]; stride];
+        for w in stride..stride * (geo.stridecount + 1) {
+            let word = (frames[w / 2] >> (w % 2 * 16)) as u16;
+            let reg = &mut want[w % stride];
+            let fb = reg[0] ^ word;
+            let (t, u) = (&table[(fb & 0xff) as usize][0], &table[(fb >> 8) as usize][1]);
+            *reg = std::array::from_fn(|k| reg.get(k + 1).copied().unwrap_or(0) ^ t[k] ^ u[k]);
+        }
+        for chunk in [1, 13, 777, frames.len()] {
+            let mut enc = ParityEncoder::new(geo);
+            for c in frames.chunks(chunk) {
+                enc.push(c);
+            }
+            assert_eq!(enc.registers(), want.as_flattened(), "chunk {chunk}");
+        }
     }
 
     fn apply(frames: &mut [u32], fixes: &[Fix]) {

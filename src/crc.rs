@@ -50,12 +50,13 @@ impl OffsetAccum {
     pub fn push(&mut self, pos: u64, frames: &[u32]) {
         let n = self.lo.len();
         let last = n - 1;
-        for (i, &s) in frames.iter().enumerate() {
-            let q = pos as i64 + i as i64 - self.offset;
-            if q < 0 {
-                continue;
-            }
-            let q = q as u64;
+        // Shifted position of frames[0]; frames before 0 are off the disc.
+        let q0 = pos as i64 - self.offset;
+        let mut i = (-q0).max(0) as usize;
+        // Splits the frames into runs within one track, so the inner loop is
+        // a plain multiply-accumulate.
+        while i < frames.len() {
+            let q = (q0 + i as i64) as u64;
             while self.track < n && q >= self.bounds[self.track + 1] {
                 self.track += 1;
             }
@@ -64,14 +65,32 @@ impl OffsetAccum {
             }
             let k = self.track;
             let start = self.bounds[k];
-            let len = self.bounds[k + 1] - start;
-            let mult = q - start + 1;
-            if (k == 0 && mult < SKIP_FRAMES) || (k == last && mult + SKIP_FRAMES > len) {
-                continue;
+            let end = self.bounds[k + 1];
+            let run_end = i + (end - q).min((frames.len() - i) as u64) as usize;
+            // Multipliers (1-based position in the track) that count.
+            let lo_mult = if k == 0 { SKIP_FRAMES } else { 1 };
+            let hi_mult = if k == last {
+                (end - start).saturating_sub(SKIP_FRAMES)
+            } else {
+                end - start
+            };
+            let first = q - start + 1;
+            let a = i + lo_mult.saturating_sub(first) as usize;
+            let b = run_end.min(i + (hi_mult + 1).saturating_sub(first) as usize);
+            if a < b {
+                // Track lengths fit in 32 bits, so a 32×32→64 multiply does.
+                let mut mult = (first + (a - i) as u64) as u32;
+                let (mut lo, mut hi) = (self.lo[k], self.hi[k]);
+                for &s in &frames[a..b] {
+                    let prod = s as u64 * mult as u64;
+                    lo = lo.wrapping_add(prod as u32);
+                    hi = hi.wrapping_add((prod >> 32) as u32);
+                    mult = mult.wrapping_add(1);
+                }
+                self.lo[k] = lo;
+                self.hi[k] = hi;
             }
-            let prod = s as u64 * mult;
-            self.lo[k] = self.lo[k].wrapping_add(prod as u32);
-            self.hi[k] = self.hi[k].wrapping_add((prod >> 32) as u32);
+            i = run_end;
         }
     }
 
@@ -130,6 +149,15 @@ impl Frame450Windows {
 
     pub fn range(&self) -> i64 {
         self.range
+    }
+
+    pub fn tracks(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// The disc position just past track `k`'s window.
+    pub fn end(&self, k: usize) -> u64 {
+        (self.starts[k] + self.bufs[k].len() as i64) as u64
     }
 }
 
@@ -213,6 +241,46 @@ mod tests {
         for k in 0..3 {
             let t = &disc[b[k] as usize..b[k + 1] as usize];
             assert_eq!(got[k], reference(t, k == 0, k == 2), "track {k}");
+        }
+    }
+
+    #[test]
+    fn offsets_match_naive() {
+        let lens = [SECTOR_FRAMES * 6 + 7, SECTOR_FRAMES * 3, SECTOR_FRAMES * 11 + 1];
+        let total: u64 = lens.iter().sum();
+        let disc = noise(total as usize, 5);
+        let b = bounds(&lens);
+        for offset in [-3000, -2939, -37, -1, 0, 1, 588, 2939, 3000] {
+            // Per frame, as the checksum is defined.
+            let (mut lo, mut hi) = (vec![0u32; 3], vec![0u32; 3]);
+            for (p, &s) in disc.iter().enumerate() {
+                let q = p as i64 - offset;
+                let Some(k) = (0..3).find(|&k| q >= b[k] as i64 && q < b[k + 1] as i64) else {
+                    continue;
+                };
+                let mult = (q - b[k] as i64 + 1) as u64;
+                let len = b[k + 1] - b[k];
+                if (k == 0 && mult < SKIP_FRAMES) || (k == 2 && mult + SKIP_FRAMES > len) {
+                    continue;
+                }
+                let prod = s as u64 * mult;
+                lo[k] = lo[k].wrapping_add(prod as u32);
+                hi[k] = hi[k].wrapping_add((prod >> 32) as u32);
+            }
+            for chunk in [1, 587, 4096, total as usize] {
+                let mut acc = OffsetAccum::new(offset, b.clone());
+                for (i, c) in disc.chunks(chunk).enumerate() {
+                    acc.push((i * chunk) as u64, c);
+                }
+                let got = acc.finish();
+                for k in 0..3 {
+                    let want = TrackCrc {
+                        v1: lo[k],
+                        v2: lo[k].wrapping_add(hi[k]),
+                    };
+                    assert_eq!(got[k], want, "offset {offset} chunk {chunk} track {k}");
+                }
+            }
         }
     }
 

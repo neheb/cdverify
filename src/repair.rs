@@ -231,7 +231,7 @@ impl Pass {
         self.enc.push(frames);
         for &f in frames {
             self.mark();
-            self.crc.update(&f.to_le_bytes());
+            self.crc.update_frame(f);
             self.pos += 1;
         }
     }
@@ -538,13 +538,16 @@ pub fn write_repaired(
 /// IEEE CRC32, as used by CTDB.
 struct Crc32 {
     reg: u32,
+    tables: &'static [[u32; 256]; 4],
 }
 
-fn crc_table() -> &'static [u32; 256] {
-    static T: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+/// Slice-by-4 tables: `[n][b]` is byte `b`'s CRC followed by `n` zero bytes.
+/// `[0]` is the usual byte-at-a-time table.
+fn crc_tables() -> &'static [[u32; 256]; 4] {
+    static T: std::sync::OnceLock<[[u32; 256]; 4]> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let mut t = [0u32; 256];
-        for (i, v) in t.iter_mut().enumerate() {
+        let mut t = [[0u32; 256]; 4];
+        for (i, v) in t[0].iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
                 c = if c & 1 != 0 {
@@ -555,17 +558,41 @@ fn crc_table() -> &'static [u32; 256] {
             }
             *v = c;
         }
+        for n in 1..4 {
+            for i in 0..256 {
+                let prev = t[n - 1][i];
+                t[n][i] = t[0][(prev & 0xff) as usize] ^ (prev >> 8);
+            }
+        }
         t
     })
 }
 
+fn crc_table() -> &'static [u32; 256] {
+    &crc_tables()[0]
+}
+
 impl Crc32 {
     fn new() -> Crc32 {
-        Crc32 { reg: 0xffff_ffff }
+        Crc32 {
+            reg: 0xffff_ffff,
+            tables: crc_tables(),
+        }
     }
 
+    #[cfg(test)]
     fn update(&mut self, bytes: &[u8]) {
         self.reg = crc32_raw(self.reg, bytes);
+    }
+
+    /// Adds a frame's 4 bytes (little-endian) in one step.
+    fn update_frame(&mut self, frame: u32) {
+        let t = self.tables;
+        let r = self.reg ^ frame;
+        self.reg = t[3][(r & 0xff) as usize]
+            ^ t[2][((r >> 8) & 0xff) as usize]
+            ^ t[1][((r >> 16) & 0xff) as usize]
+            ^ t[0][(r >> 24) as usize];
     }
 
     fn value(&self) -> u32 {
@@ -648,6 +675,23 @@ mod tests {
     #[test]
     fn crc32_known_value() {
         assert_eq!(crc(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn crc32_frames_match_bytes() {
+        let frames: [u32; 5] = [
+            0x0000_0000,
+            0xdead_beef,
+            0x0102_0304,
+            0xffff_ffff,
+            0x8000_7fff,
+        ];
+        let (mut a, mut b) = (Crc32::new(), Crc32::new());
+        for f in frames {
+            a.update(&f.to_le_bytes());
+            b.update_frame(f);
+            assert_eq!(a.value(), b.value());
+        }
     }
 
     #[test]

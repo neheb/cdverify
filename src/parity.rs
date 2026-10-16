@@ -269,6 +269,8 @@ pub struct ParityEncoder {
     leadin: Vec<u16>,
     leadout: Vec<u16>,
     pos: usize,
+    /// `pos % stride`, kept as a counter: 32-bit ARM has no divide instruction.
+    col: usize,
 }
 
 impl ParityEncoder {
@@ -280,6 +282,7 @@ impl ParityEncoder {
             leadin: vec![0; (geo.stride * 2).max(4096 * 4)],
             leadout: vec![0; (geo.stride + geo.laststride).max(4096 * 4)],
             pos: 0,
+            col: 0,
         }
     }
 
@@ -301,17 +304,26 @@ impl ParityEncoder {
                     }
                 }
                 if w >= lo_end && w < hi_end {
-                    let col = w % geo.stride;
-                    let reg = &mut self.parity[col * MAX_NPAR..(col + 1) * MAX_NPAR];
+                    let at = self.col * MAX_NPAR;
+                    let reg: &mut [u16; MAX_NPAR] =
+                        (&mut self.parity[at..at + MAX_NPAR]).try_into().unwrap();
                     let fb = reg[0] ^ word;
                     let t0 = &self.table[(fb & 0xff) as usize][0];
                     let t1 = &self.table[(fb >> 8) as usize][1];
-                    for k in 0..MAX_NPAR - 1 {
-                        reg[k] = reg[k + 1] ^ t0[k] ^ t1[k];
+                    // Shift the register by one word, then add the feedback.
+                    // Whole fixed-size arrays let the compiler vectorize this.
+                    let mut next = [0u16; MAX_NPAR];
+                    next[..MAX_NPAR - 1].copy_from_slice(&reg[1..]);
+                    for k in 0..MAX_NPAR {
+                        next[k] ^= t0[k] ^ t1[k];
                     }
-                    reg[MAX_NPAR - 1] = t0[MAX_NPAR - 1] ^ t1[MAX_NPAR - 1];
+                    *reg = next;
                 }
                 self.pos += 1;
+                self.col += 1;
+                if self.col == geo.stride {
+                    self.col = 0;
+                }
             }
         }
     }

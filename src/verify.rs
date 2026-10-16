@@ -993,10 +993,7 @@ fn candidate_offsets(
 ) -> Vec<i64> {
     let range = w.range();
     let mut hits = vec![0u32; 2 * range as usize + 1];
-    let ntracks = pressings
-        .first()
-        .map_or(0, |p| p.entries.len())
-        .min(tracks);
+    let ntracks = pressings.first().map_or(0, |p| p.entries.len()).min(tracks);
     for k in 0..ntracks {
         let targets: Vec<u32> = pressings
             .iter()

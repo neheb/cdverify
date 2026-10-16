@@ -246,7 +246,11 @@ mod tests {
 
     #[test]
     fn offsets_match_naive() {
-        let lens = [SECTOR_FRAMES * 6 + 7, SECTOR_FRAMES * 3, SECTOR_FRAMES * 11 + 1];
+        let lens = [
+            SECTOR_FRAMES * 6 + 7,
+            SECTOR_FRAMES * 3,
+            SECTOR_FRAMES * 11 + 1,
+        ];
         let total: u64 = lens.iter().sum();
         let disc = noise(total as usize, 5);
         let b = bounds(&lens);

@@ -326,7 +326,10 @@ impl ParityEncoder {
         }
         // Words in strides 1..=stridecount, word `w` going to column
         // `w % stride`, one stride at a time.
-        let (mut w, b) = (w0.max(geo.stride), w1.min(geo.stride * (geo.stridecount + 1)));
+        let (mut w, b) = (
+            w0.max(geo.stride),
+            w1.min(geo.stride * (geo.stridecount + 1)),
+        );
         while w < b {
             let row = w / geo.stride;
             let end = b.min((row + 1) * geo.stride);
@@ -366,7 +369,13 @@ impl ParityEncoder {
         let (rows, extra) = (fed / geo.stride, fed % geo.stride);
         let mut out = vec![0u16; self.parity.len()];
         let regs = self.parity.as_chunks::<MAX_NPAR>().0;
-        for (c, (o, r)) in out.as_chunks_mut::<MAX_NPAR>().0.iter_mut().zip(regs).enumerate() {
+        for (c, (o, r)) in out
+            .as_chunks_mut::<MAX_NPAR>()
+            .0
+            .iter_mut()
+            .zip(regs)
+            .enumerate()
+        {
             let n = (rows + (c < extra) as usize) % MAX_NPAR;
             *o = std::array::from_fn(|k| r[(k + n) % MAX_NPAR]);
         }
@@ -604,7 +613,10 @@ mod tests {
             let word = (frames[w / 2] >> (w % 2 * 16)) as u16;
             let reg = &mut want[w % stride];
             let fb = reg[0] ^ word;
-            let (t, u) = (&table[(fb & 0xff) as usize][0], &table[(fb >> 8) as usize][1]);
+            let (t, u) = (
+                &table[(fb & 0xff) as usize][0],
+                &table[(fb >> 8) as usize][1],
+            );
             *reg = std::array::from_fn(|k| reg.get(k + 1).copied().unwrap_or(0) ^ t[k] ^ u[k]);
         }
         for chunk in [1, 13, 777, frames.len()] {

@@ -1,6 +1,6 @@
 [package]
 name = "cdverify"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["Rosen Penev"]
 description = "Verify CD rips against AccurateRip and CTDB, and repair them with CTDB parity data"

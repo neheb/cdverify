@@ -1,5 +1,5 @@
 # Pushing a tag like v1.2.3 tests the code, builds static Linux binaries for
-# amd64, ARMv6 (Raspberry Pi 1/Zero) and aarch64 plus a Windows x64 binary,
+# amd64, ARMv6 (Raspberry Pi 1/Zero), ARMv7 and aarch64 plus a Windows x64 binary,
 # and publishes them as a GitHub release. Everything is pure Rust, so rust-lld
 # links all Linux targets without a cross toolchain.
 name: Release
@@ -38,6 +38,8 @@ jobs:
             target: x86_64-unknown-linux-musl
           - arch: armv6
             target: arm-unknown-linux-musleabihf
+          - arch: armv7
+            target: armv7-unknown-linux-musleabihf
           - arch: aarch64
             target: aarch64-unknown-linux-musl
     env:
@@ -45,6 +47,7 @@ jobs:
       TARGET: ${{ matrix.target }}
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
       CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABIHF_LINKER: rust-lld
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: rust-lld
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

@@ -166,7 +166,7 @@ fn without_repair(album: &verify::AlbumResult) -> verify::AlbumResult {
             album.reason = reason.to_string();
         }
         if outcome == repair::Outcome::Verified {
-            album.recheck = album.verdict != verify::Verdict::Accurate;
+            album.recheck = verify::needs_recheck(&album);
         }
     }
     album.repair = None;
@@ -202,9 +202,11 @@ fn maybe_repair(
             album.reason = format!("{}; {}", album.reason, outcome.verdict_note());
         }
         // An exact CTDB match is a final answer (until --rescan), like an
-        // accurate rip; everything else is worth rechecking next run.
-        if outcome == repair::Outcome::Verified {
-            album.recheck = false;
+        // accurate rip; a failed check is worth retrying next run.
+        match outcome {
+            repair::Outcome::Verified => album.recheck = false,
+            repair::Outcome::Failed => album.recheck = true,
+            _ => {}
         }
         album.repair_outcome = Some(outcome);
         album.repair = Some(msg);
@@ -328,7 +330,13 @@ fn start(
                             true => (c.get_other(&dir, s)?, &other_opts),
                             false => (c.get(&dir, s)?, &opts),
                         };
-                        verify::cached_valid(&albums, o).then_some(albums)
+                        // A repairable album gets its repaired copy written
+                        // when --repair is given.
+                        let unrepaired = ro.out.is_some()
+                            && albums
+                                .iter()
+                                .any(|a| a.repair_outcome == Some(repair::Outcome::Repairable));
+                        (verify::cached_valid(&albums, o) && !unrepaired).then_some(albums)
                     };
                     let hit = cached(false);
                     let other_hit = both.then(|| cached(true)).flatten();

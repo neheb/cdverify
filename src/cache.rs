@@ -194,7 +194,7 @@ mod tests {
             title: "t".into(),
             dir: "/x".into(),
             verdict: if recheck {
-                Verdict::RipErrors
+                Verdict::CannotCheck
             } else {
                 Verdict::Accurate
             },

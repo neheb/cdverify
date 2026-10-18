@@ -551,15 +551,32 @@ pub fn verify_with(
                 format!("In CTDB (confidence {conf}), {data}")
             }
             Ok(None) => "Not in CTDB".into(),
-            Err(e) => format!("CTDB lookup failed: {e}"),
+            Err(e) => format!("{CTDB_LOOKUP_FAILED}: {e}"),
         };
         result.ctdb_repair = Some(note);
     }
     if result.diagnosis.is_some() {
         result.reason.push_str("; sample slip, re-rip needed");
     }
-    result.recheck = result.verdict != Verdict::Accurate;
+    result.recheck = needs_recheck(&result);
     result
+}
+
+const CTDB_LOOKUP_FAILED: &str = "CTDB lookup failed";
+
+/// Whether a [`verify`] result may change on a later run of unchanged files:
+/// albums missing from the database (or below the confidence threshold) may
+/// be added, lookups may fail transiently and corruption may be a read error.
+/// Accurate rips and ripping errors are final.
+pub fn needs_recheck(result: &AlbumResult) -> bool {
+    match result.verdict {
+        Verdict::Accurate => false,
+        Verdict::RipErrors => result
+            .ctdb_repair
+            .as_deref()
+            .is_some_and(|n| n.starts_with(CTDB_LOOKUP_FAILED)),
+        Verdict::Corrupted | Verdict::CannotCheck => true,
+    }
 }
 
 /// Whether cached results still hold under the current options.
@@ -649,6 +666,9 @@ pub fn verify_ctdb_first(
         ar.ctdb_toc = Some(toc);
         ar.repair_outcome = Some(outcome);
         ar.repair = Some(msg.clone());
+        if outcome == Outcome::Failed {
+            ar.recheck = true;
+        }
         match ar.verdict {
             Verdict::Accurate => ar.reason.push_str("; differs from CTDB"),
             Verdict::RipErrors => {

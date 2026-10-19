@@ -287,10 +287,16 @@ fn rotated_tables() -> &'static [EncodeTable] {
 /// rotated by the number of updates they've had, and each stride's updates
 /// use the table rotated to match. That leaves a plain load-xor-store,
 /// without the lane shuffles that are slow on 32-bit ARM.
+///
+/// With NEON, that update is slow on Cortex-A9 though, so there strides
+/// wait to be fed to [`neon::feed_block`] a block at a time instead.
 pub struct ParityEncoder {
     geo: Geometry,
     /// `stride` registers of `MAX_NPAR` words, rotated as above.
     parity: Vec<u16>,
+    /// Words of the block's strides not yet in `parity`.
+    #[cfg(neon)]
+    pending: Vec<u16>,
     /// [`ParityEncoder::registers`], once worked out.
     unrotated: OnceLock<Vec<u16>>,
     leadin: Vec<u16>,
@@ -303,6 +309,8 @@ impl ParityEncoder {
         ParityEncoder {
             geo,
             parity: vec![0; geo.stride * MAX_NPAR],
+            #[cfg(neon)]
+            pending: Vec::new(),
             unrotated: OnceLock::new(),
             leadin: vec![0; (geo.stride * 2).max(4096 * 4)],
             leadout: vec![0; (geo.stride + geo.laststride).max(4096 * 4)],
@@ -324,34 +332,42 @@ impl ParityEncoder {
         for w in w0.max(geo.words.saturating_sub(self.leadout.len()))..w1.min(geo.words) {
             self.leadout[geo.words - 1 - w] = word(w);
         }
-        // Words in strides 1..=stridecount, word `w` going to column
-        // `w % stride`, one stride at a time.
-        let (mut w, b) = (
+        // Words in strides 1..=stridecount.
+        let (w, b) = (
             w0.max(geo.stride),
             w1.min(geo.stride * (geo.stridecount + 1)),
         );
+        #[cfg(neon)]
+        let w = self.push_blocks(frames, w0, w, b);
+        update_strides(&mut self.parity, w, b, word);
+    }
+
+    /// The end of the strides fed a block at a time: those in whole blocks.
+    #[cfg(neon)]
+    fn blocks_end(&self) -> usize {
+        let blocks = self.geo.stridecount / neon::BLOCK_STRIDES;
+        self.geo.stride * (1 + blocks * neon::BLOCK_STRIDES)
+    }
+
+    /// Takes words `w..b` up to [`Self::blocks_end`] into `pending`, feeding
+    /// each block once it's whole. Returns where the words left begin.
+    #[cfg(neon)]
+    fn push_blocks(&mut self, frames: &[u32], w0: usize, mut w: usize, b: usize) -> usize {
+        let block = self.geo.stride * neon::BLOCK_STRIDES;
+        let b = b.min(self.blocks_end());
         while w < b {
-            let row = w / geo.stride;
-            let end = b.min((row + 1) * geo.stride);
-            // The registers' first word is at `h`; it's replaced by the last.
-            let h = (row - 1) % MAX_NPAR;
-            // Through black_box so that it stays in registers rather than
-            // being rebuilt for every word.
-            let keep: [u16; MAX_NPAR] =
-                std::hint::black_box(std::array::from_fn(|j| if j == h { 0 } else { !0 }));
-            let rot = &rotated_tables()[h];
-            let regs = self.parity[(w - row * geo.stride) * MAX_NPAR..]
-                .as_chunks_mut::<MAX_NPAR>()
-                .0;
-            for (reg, w) in regs.iter_mut().zip(w..end) {
-                let fb = reg[h] ^ word(w);
-                let t = &rot[(fb & 0xff) as usize][0];
-                let u = &rot[(fb >> 8) as usize][1];
-                let r = *reg;
-                *reg = std::array::from_fn(|j| (r[j] & keep[j]) ^ t[j] ^ u[j]);
+            let end = b.min(w + block - self.pending.len());
+            // Strides start at even words, so this is whole frames.
+            let run = &frames[(w - w0) / 2..(end - w0) / 2];
+            self.pending
+                .extend(run.iter().flat_map(|&f| [f as u16, (f >> 16) as u16]));
+            if self.pending.len() == block {
+                neon::feed_block(&mut self.parity, &self.pending);
+                self.pending.clear();
             }
             w = end;
         }
+        w
     }
 
     /// The parity registers, unrotated: register `c` in words
@@ -362,13 +378,24 @@ impl ParityEncoder {
 
     fn unrotate(&self) -> Vec<u16> {
         let geo = self.geo;
+        // With the strides of a block not yet fed, as if they had been.
+        #[cfg(neon)]
+        let parity = {
+            let mut parity = self.parity.clone();
+            let end = self.pos.min(self.blocks_end());
+            let start = end - self.pending.len();
+            update_strides(&mut parity, start, end, |w| self.pending[w - start]);
+            parity
+        };
+        #[cfg(not(neon))]
+        let parity = &self.parity;
         // Updates every register has had, plus one for those fed in a
         // partial stride.
         let fed = self.pos.min(geo.stride * (geo.stridecount + 1));
         let fed = fed.saturating_sub(geo.stride);
         let (rows, extra) = (fed / geo.stride, fed % geo.stride);
-        let mut out = vec![0u16; self.parity.len()];
-        let regs = self.parity.as_chunks::<MAX_NPAR>().0;
+        let mut out = vec![0u16; parity.len()];
+        let regs = parity.as_chunks::<MAX_NPAR>().0;
         for (c, (o, r)) in out
             .as_chunks_mut::<MAX_NPAR>()
             .0
@@ -419,6 +446,194 @@ impl ParityEncoder {
 
     pub fn geometry(&self) -> Geometry {
         self.geo
+    }
+}
+
+/// Updates the registers with words `w..b` of the album, `word(w)` being
+/// word `w`, a stride at a time: word `w` goes to column `w % stride`.
+fn update_strides(parity: &mut [u16], mut w: usize, b: usize, word: impl Fn(usize) -> u16) {
+    let stride = parity.len() / MAX_NPAR;
+    while w < b {
+        let row = w / stride;
+        let end = b.min((row + 1) * stride);
+        // The registers' first word is at `h`; it's replaced by the last.
+        let h = (row - 1) % MAX_NPAR;
+        // Through black_box so that it stays in registers rather than
+        // being rebuilt for every word.
+        let keep: [u16; MAX_NPAR] =
+            std::hint::black_box(std::array::from_fn(|j| if j == h { 0 } else { !0 }));
+        let rot = &rotated_tables()[h];
+        let regs = parity[(w - row * stride) * MAX_NPAR..]
+            .as_chunks_mut::<MAX_NPAR>()
+            .0;
+        for (reg, w) in regs.iter_mut().zip(w..end) {
+            let fb = reg[h] ^ word(w);
+            let t = &rot[(fb & 0xff) as usize][0];
+            let u = &rot[(fb >> 8) as usize][1];
+            let r = *reg;
+            *reg = std::array::from_fn(|j| (r[j] & keep[j]) ^ t[j] ^ u[j]);
+        }
+        w = end;
+    }
+}
+
+/// The parity update for ARMv7 with NEON (Cortex-A9 in particular).
+///
+/// The row-at-a-time update loads and stores a register per word, and NEON
+/// stores are slow on Cortex-A9. Instead, [`BLOCK_STRIDES`] strides at a time,
+/// each register is held in NEON registers while it takes its column's words
+/// and shifts as the code is defined. That many updates rotate the registers
+/// back to where they started, so `parity` keeps its layout.
+#[cfg(neon)]
+mod neon {
+    use super::{MAX_NPAR, rotated_tables};
+
+    /// Strides fed at a time: a whole turn of the registers' rotation.
+    pub const BLOCK_STRIDES: usize = MAX_NPAR;
+
+    /// Updates the registers, unrotated, with `words`: [`BLOCK_STRIDES`]
+    /// whole strides.
+    pub fn feed_block(parity: &mut [u16], words: &[u16]) {
+        // Rotated by a whole turn: the plain table.
+        let table = &rotated_tables()[MAX_NPAR - 1];
+        let stride = parity.len() / MAX_NPAR;
+        assert_eq!(words.len(), stride * BLOCK_STRIDES);
+        let (quads, rest) = parity.as_chunks_mut::<{ 4 * MAX_NPAR }>();
+        feed_quads(quads, words, table);
+        let done = quads.len() * 4;
+        for (c, reg) in rest.as_chunks_mut::<MAX_NPAR>().0.iter_mut().enumerate() {
+            let mut r = *reg;
+            for &w in words.iter().skip(done + c).step_by(stride) {
+                let fb = r[0] ^ w;
+                let (t, u) = (
+                    &table[(fb & 0xff) as usize][0],
+                    &table[(fb >> 8) as usize][1],
+                );
+                r = std::array::from_fn(|k| r.get(k + 1).copied().unwrap_or(0) ^ t[k] ^ u[k]);
+            }
+            *reg = r;
+        }
+    }
+
+    /// [`feed_block`] for the columns in `quads`, four at a time.
+    ///
+    /// Every update needs its register's first word moved from NEON to the
+    /// core for the table lookup, which on Cortex-A9 stalls until the NEON
+    /// pipeline drains, so four columns share each drain. LLVM doesn't
+    /// schedule it this way: this is twice as fast.
+    #[allow(unsafe_code)]
+    fn feed_quads(quads: &mut [[u16; 4 * MAX_NPAR]], words: &[u16], table: &super::EncodeTable) {
+        let stride = words.len() / BLOCK_STRIDES;
+        for (c, quad) in quads.iter_mut().enumerate() {
+            // SAFETY: the registers are the 128 bytes of `quad`. The words read
+            // are 8 bytes at `4 * c` in each of the block's `BLOCK_STRIDES`
+            // strides, inside `words` since `4 * c + 4 <= stride`. Table rows are
+            // at most 255 * 64 + 64 bytes in. Unaligned word loads are fine on
+            // ARMv7 Linux.
+            unsafe {
+                std::arch::asm!(
+                    // Registers: q0:q1, q10:q11, q12:q13, q6:q7. q15 is zero.
+                    "vld1.16 {{d0-d3}}, [{reg}]!",
+                    "vld1.16 {{d20-d23}}, [{reg}]!",
+                    "vld1.16 {{d24-d27}}, [{reg}]!",
+                    "vld1.16 {{d12-d15}}, [{reg}]",
+                    "sub {reg}, {reg}, #96",
+                    "vmov.i16 q15, #0",
+                    "2:",
+                    // Feedback: each register's first word ^ its column's word.
+                    "vmov.u16 {f0}, d0[0]",
+                    "vmov.u16 {f1}, d20[0]",
+                    "vmov.u16 {f2}, d24[0]",
+                    "vmov.u16 {f3}, d12[0]",
+                    "ldr {x}, [{wp}]",
+                    "ldr {y}, [{wp}, #4]",
+                    "add {wp}, {wp}, {stride_bytes}",
+                    // Shift each register by a word.
+                    "vext.16 q0, q0, q1, #1",
+                    "vext.16 q1, q1, q15, #1",
+                    "vext.16 q10, q10, q11, #1",
+                    "vext.16 q11, q11, q15, #1",
+                    "vext.16 q12, q12, q13, #1",
+                    "vext.16 q13, q13, q15, #1",
+                    "vext.16 q6, q6, q7, #1",
+                    "vext.16 q7, q7, q15, #1",
+                    "eor {f0}, {f0}, {x}",
+                    "eor {f1}, {f1}, {x}, lsr #16",
+                    "eor {f2}, {f2}, {y}",
+                    "eor {f3}, {f3}, {y}, lsr #16",
+                    // XOR in table[fb & 0xff][0] and table[fb >> 8][1] (rows of
+                    // 64 bytes, the second half at 32).
+                    "uxtb {t}, {f0}",
+                    "ubfx {u}, {f0}, #8, #8",
+                    "add {t}, {table}, {t}, lsl #6",
+                    "add {u}, {table}, {u}, lsl #6",
+                    "vld1.16 {{d4-d7}}, [{t}]",
+                    "add {u}, {u}, #32",
+                    "vld1.16 {{d16-d19}}, [{u}]",
+                    "veor q0, q0, q2",
+                    "veor q1, q1, q3",
+                    "veor q0, q0, q8",
+                    "veor q1, q1, q9",
+                    "uxtb {t}, {f1}",
+                    "ubfx {u}, {f1}, #8, #8",
+                    "add {t}, {table}, {t}, lsl #6",
+                    "add {u}, {table}, {u}, lsl #6",
+                    "vld1.16 {{d4-d7}}, [{t}]",
+                    "add {u}, {u}, #32",
+                    "vld1.16 {{d16-d19}}, [{u}]",
+                    "veor q10, q10, q2",
+                    "veor q11, q11, q3",
+                    "veor q10, q10, q8",
+                    "veor q11, q11, q9",
+                    "uxtb {t}, {f2}",
+                    "ubfx {u}, {f2}, #8, #8",
+                    "add {t}, {table}, {t}, lsl #6",
+                    "add {u}, {table}, {u}, lsl #6",
+                    "vld1.16 {{d4-d7}}, [{t}]",
+                    "add {u}, {u}, #32",
+                    "vld1.16 {{d16-d19}}, [{u}]",
+                    "veor q12, q12, q2",
+                    "veor q13, q13, q3",
+                    "veor q12, q12, q8",
+                    "veor q13, q13, q9",
+                    "uxtb {t}, {f3}",
+                    "ubfx {u}, {f3}, #8, #8",
+                    "add {t}, {table}, {t}, lsl #6",
+                    "add {u}, {table}, {u}, lsl #6",
+                    "vld1.16 {{d4-d7}}, [{t}]",
+                    "add {u}, {u}, #32",
+                    "vld1.16 {{d16-d19}}, [{u}]",
+                    "veor q6, q6, q2",
+                    "veor q7, q7, q3",
+                    "veor q6, q6, q8",
+                    "veor q7, q7, q9",
+                    "subs {n}, {n}, #1",
+                    "bne 2b",
+                    "vst1.16 {{d0-d3}}, [{reg}]!",
+                    "vst1.16 {{d20-d23}}, [{reg}]!",
+                    "vst1.16 {{d24-d27}}, [{reg}]!",
+                    "vst1.16 {{d12-d15}}, [{reg}]",
+                    reg = inout(reg) quad.as_mut_ptr() => _,
+                    wp = inout(reg) words.as_ptr().add(4 * c) => _,
+                    n = inout(reg) BLOCK_STRIDES => _,
+                    stride_bytes = in(reg) stride * 2,
+                    table = in(reg) table.as_ptr(),
+                    f0 = out(reg) _,
+                    f1 = out(reg) _,
+                    f2 = out(reg) _,
+                    f3 = out(reg) _,
+                    x = out(reg) _,
+                    y = out(reg) _,
+                    t = out(reg) _,
+                    u = out(reg) _,
+                    out("q0") _, out("q1") _, out("q2") _, out("q3") _,
+                    out("q6") _, out("q7") _, out("q8") _, out("q9") _,
+                    out("q10") _, out("q11") _, out("q12") _, out("q13") _,
+                    out("q15") _,
+                    options(nostack),
+                );
+            }
+        }
     }
 }
 
@@ -604,27 +819,44 @@ mod tests {
     #[test]
     fn registers_match_shift_register() {
         let table = Galois::get().encode_table();
-        let stride = 40;
-        // 37 strides of parity: not a whole number of register rotations.
-        let frames = noise(stride / 2 * 39 + 7, 11);
-        let geo = Geometry::new(frames.len() as u64, stride);
-        let mut want = vec![[0u16; MAX_NPAR]; stride];
-        for w in stride..stride * (geo.stridecount + 1) {
-            let word = (frames[w / 2] >> (w % 2 * 16)) as u16;
-            let reg = &mut want[w % stride];
-            let fb = reg[0] ^ word;
-            let (t, u) = (
-                &table[(fb & 0xff) as usize][0],
-                &table[(fb >> 8) as usize][1],
-            );
-            *reg = std::array::from_fn(|k| reg.get(k + 1).copied().unwrap_or(0) ^ t[k] ^ u[k]);
-        }
-        for chunk in [1, 13, 777, frames.len()] {
-            let mut enc = ParityEncoder::new(geo);
-            for c in frames.chunks(chunk) {
-                enc.push(c);
+        // 42 words leaves columns over from NEON's groups of four.
+        for stride in [40, 42] {
+            // 37 strides of parity: not a whole number of register rotations.
+            let frames = noise(stride / 2 * 39 + 7, 11);
+            let geo = Geometry::new(frames.len() as u64, stride);
+            // The registers after the first `n` frames, by the definition.
+            let want = |n: usize| {
+                let mut want = vec![[0u16; MAX_NPAR]; stride];
+                for w in stride..(stride * (geo.stridecount + 1)).min(n * 2) {
+                    let word = (frames[w / 2] >> (w % 2 * 16)) as u16;
+                    let reg = &mut want[w % stride];
+                    let fb = reg[0] ^ word;
+                    let (t, u) = (
+                        &table[(fb & 0xff) as usize][0],
+                        &table[(fb >> 8) as usize][1],
+                    );
+                    *reg =
+                        std::array::from_fn(|k| reg.get(k + 1).copied().unwrap_or(0) ^ t[k] ^ u[k]);
+                }
+                want.into_flattened()
+            };
+            for chunk in [1, 13, 777, frames.len()] {
+                let mut enc = ParityEncoder::new(geo);
+                for c in frames.chunks(chunk) {
+                    enc.push(c);
+                }
+                assert_eq!(
+                    enc.registers(),
+                    want(frames.len()),
+                    "stride {stride} chunk {chunk}"
+                );
             }
-            assert_eq!(enc.registers(), want.as_flattened(), "chunk {chunk}");
+            // Partway, including partway through a stride.
+            for n in [stride * 5 + 3, stride * 12, stride * 17 + 1] {
+                let mut enc = ParityEncoder::new(geo);
+                enc.push(&frames[..n]);
+                assert_eq!(enc.registers(), want(n), "stride {stride} after {n}");
+            }
         }
     }
 

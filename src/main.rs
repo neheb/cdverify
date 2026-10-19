@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod app;
 mod cache;

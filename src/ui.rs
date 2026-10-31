@@ -260,6 +260,7 @@ fn verdict_style(v: Verdict) -> Style {
         Verdict::Corrupted => Style::new().magenta(),
         Verdict::RipErrors => Style::new().red(),
         Verdict::Accurate => Style::new().green(),
+        Verdict::NotFound => Style::new().blue(),
         Verdict::CannotCheck => Style::new().yellow(),
     }
 }

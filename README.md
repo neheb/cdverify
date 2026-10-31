@@ -5,14 +5,15 @@ music library, groups tracks into albums and verifies each album against the
 [AccurateRip](http://www.accuraterip.com) database and the CUETools database
 (CTDB), which can also repair rips with errors.
 
-Results are grouped into the same four lists as PerfectTUNES:
+Results are grouped into the same four lists as PerfectTUNES, plus one for discs AccurateRip doesn't know:
 
 | List | Meaning |
 |------|---------|
 | Tracks Corrupted | A file failed to decode or its FLAC MD5 doesn't match the audio |
 | Ripping Errors | The disc is in AccurateRip but one or more tracks don't match |
 | Accurately Ripped | Every track matches with at least `--min-confidence` |
-| Cannot Check | Lossy/unsupported/non-CD audio, incomplete album, or not in the database |
+| Not Found | The disc isn't in the AccurateRip database |
+| Cannot Check | Lossy/unsupported/non-CD audio, incomplete album, tracks below `--min-confidence`, or a failed lookup |
 
 ## Install
 
@@ -96,11 +97,11 @@ sizes and modification times. Only final results are cached:
 - Accurately Ripped albums.
 - Cannot Check albums for permanent reasons: lossy, not CD quality, or incomplete.
 
-Ripping errors, "not in database", corrupted tracks and failed lookups are checked again on every run. The database gains submissions over time, and a corruption seen over a network share may be a temporary read error. A cached Accurate result is also re-checked when it no longer meets `--min-confidence`, or when it came from a tag and `--no-tag` is given.
+Ripping errors, Not Found albums, corrupted tracks and failed lookups are checked again on every run. The database gains submissions over time, and a corruption seen over a network share may be a temporary read error. A cached Accurate result is also re-checked when it no longer meets `--min-confidence`, or when it came from a tag and `--no-tag` is given.
 
 ## Limitations
 
-- **Data-track discs without a CTDB entry.** The data track's length can't be inferred from audio files, so such an album shows up as "not in database" or as ripping errors.
+- **Data-track discs without a CTDB entry.** The data track's length can't be inferred from audio files, so such an album shows up as Not Found or as ripping errors.
 - **Pregaps.** A pregap before track 1 (sometimes with hidden audio) shifts the whole TOC. It's recovered through CTDB when CTDB knows the disc. If the pregap audio was ripped into track 1, the tracks no longer line up and the album can't be verified.
 - **WavPack, APE, TAK, WMA.** Reported as "Cannot Check" because Symphonia can't decode them.
 

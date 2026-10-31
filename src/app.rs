@@ -68,7 +68,7 @@ pub struct App {
     /// Per worker: (folder being processed, progress within it).
     pub active: BTreeMap<usize, (String, f32)>,
     pub tab: usize,
-    pub lists: [ListState; 4],
+    pub lists: [ListState; Verdict::ALL.len()],
     pub detail_scroll: usize,
     pub message: Option<String>,
     pub report_path: PathBuf,
@@ -224,11 +224,13 @@ impl App {
             KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.copy_musicbrainz_url()
             }
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.set_tab((self.tab + 1) % 4),
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                self.set_tab((self.tab + 3) % 4)
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                self.set_tab((self.tab + 1) % Verdict::ALL.len())
             }
-            KeyCode::Char(c @ '1'..='4') => self.set_tab(c as usize - '1' as usize),
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                self.set_tab((self.tab + Verdict::ALL.len() - 1) % Verdict::ALL.len())
+            }
+            KeyCode::Char(c @ '1'..='5') => self.set_tab(c as usize - '1' as usize),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Home | KeyCode::Char('g') => self.move_selection(isize::MIN),

@@ -34,14 +34,17 @@ pub enum Verdict {
     Corrupted,
     RipErrors,
     Accurate,
+    /// The disc isn't in the AccurateRip database.
+    NotFound,
     CannotCheck,
 }
 
 impl Verdict {
-    pub const ALL: [Verdict; 4] = [
+    pub const ALL: [Verdict; 5] = [
         Verdict::Corrupted,
         Verdict::RipErrors,
         Verdict::Accurate,
+        Verdict::NotFound,
         Verdict::CannotCheck,
     ];
 
@@ -50,6 +53,7 @@ impl Verdict {
             Verdict::Corrupted => "Tracks Corrupted",
             Verdict::RipErrors => "Ripping Errors",
             Verdict::Accurate => "Accurately Ripped",
+            Verdict::NotFound => "Not Found",
             Verdict::CannotCheck => "Cannot Check",
         }
     }
@@ -494,7 +498,7 @@ pub fn verify_with(
             format!("AccurateRip lookup failed: {e}"),
         )
     } else if pressings.as_ref().is_none_or(|p| p.is_empty()) {
-        (Verdict::CannotCheck, "Not in AccurateRip database".into())
+        (Verdict::NotFound, "Not in AccurateRip database".into())
     } else if count(TrackStatus::Mismatch) > 0 {
         (
             Verdict::RipErrors,
@@ -575,7 +579,7 @@ pub fn needs_recheck(result: &AlbumResult) -> bool {
             .ctdb_repair
             .as_deref()
             .is_some_and(|n| n.starts_with(CTDB_LOOKUP_FAILED)),
-        Verdict::Corrupted | Verdict::CannotCheck => true,
+        Verdict::Corrupted | Verdict::CannotCheck | Verdict::NotFound => true,
     }
 }
 
@@ -676,7 +680,7 @@ pub fn verify_ctdb_first(
             }
             Verdict::Corrupted => {}
             Verdict::CannotCheck if outcome == Outcome::Failed => {}
-            Verdict::CannotCheck => {
+            Verdict::CannotCheck | Verdict::NotFound => {
                 ar.reason = format!(
                     "Doesn't match CTDB, {}; AccurateRip: {}",
                     outcome.verdict_note(),

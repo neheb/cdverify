@@ -1,0 +1,32 @@
+# Keeps the workflows' pinned actions current (the Node.js 20 deprecation
+# warnings come from outdated pins). Dependabot updates both the commit SHA
+# and the version comment next to it. Also keeps the Rust dependencies
+# current; it doesn't flag yanked crates, which only `cargo audit` does.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    # Wait a week after a release before proposing it.
+    cooldown:
+      default-days: 7
+    # Minor and patch updates share one PR; major ones get their own, since
+    # they may need code changes. A 0.x bump (ratatui 0.30 -> 0.31) counts
+    # as minor and joins the group, so the group's CI run catches breakage.
+    groups:
+      crates:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    # Wait a week after a release before proposing it.
+    cooldown:
+      default-days: 7
+    # One PR for all actions instead of one per action.
+    groups:
+      actions:
+        patterns: ["*"]

@@ -218,6 +218,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "symphonia",
+ "symphonia-common",
  "ureq",
  "walkdir",
 ]

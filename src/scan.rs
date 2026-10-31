@@ -5,7 +5,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use symphonia::core::codecs::audio::AudioCodecParameters;
+use symphonia::core::codecs::audio::well_known::CODEC_ID_ALAC;
 use symphonia::core::meta::{MetadataRevision, StandardTag};
+use symphonia_common::apple::audio::alac::MagicCookie;
 use walkdir::WalkDir;
 
 use crate::cue::{self, CueTrack};
@@ -34,6 +37,8 @@ pub fn audio_kind(path: &Path) -> Option<Kind> {
 /// Problems that make a track non-CD audio (see `app::is_non_cd`).
 pub const LOSSY: &str = "lossy format";
 pub const UNSUPPORTED: &str = "unsupported format";
+/// Start of the problem for files Symphonia can't open.
+pub const CANNOT_DECODE: &str = "cannot decode";
 
 fn is_cue(path: &Path) -> bool {
     path.extension()
@@ -101,6 +106,16 @@ pub struct TrackInfo {
     pub problem: Option<String>,
 }
 
+/// An ALAC stream's bit depth, from its magic cookie: Symphonia's MP4 reader
+/// doesn't copy it into the codec parameters.
+fn alac_bit_depth(p: &AudioCodecParameters) -> Option<u32> {
+    if p.codec != CODEC_ID_ALAC {
+        return None;
+    }
+    let cookie = MagicCookie::read(p.extra_data.as_deref()?).ok()?;
+    Some(cookie.bit_depth.into())
+}
+
 pub fn probe_track(path: &Path) -> TrackInfo {
     let mut info = TrackInfo {
         path: path.to_path_buf(),
@@ -119,8 +134,12 @@ pub fn probe_track(path: &Path) -> TrackInfo {
     }
     let mut opened = match decode::open(path, false) {
         Ok(o) => o,
+        Err(e) if e.is::<decode::LossyCodec>() => {
+            info.problem = Some(LOSSY.into());
+            return info;
+        }
         Err(e) => {
-            info.problem = Some(format!("cannot decode: {e}"));
+            info.problem = Some(format!("{CANNOT_DECODE}: {e}"));
             return info;
         }
     };
@@ -133,7 +152,7 @@ pub fn probe_track(path: &Path) -> TrackInfo {
         info.frames = track.num_frames;
         if let Some(p) = track.codec_params.as_ref().and_then(|p| p.audio()) {
             info.sample_rate = p.sample_rate;
-            info.bits = p.bits_per_sample;
+            info.bits = p.bits_per_sample.or_else(|| alac_bit_depth(p));
             info.channels = p.channels.as_ref().map(|c| c.count());
         }
     }

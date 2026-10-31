@@ -587,6 +587,9 @@ pub fn needs_recheck(result: &AlbumResult) -> bool {
 pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
     // Results from the other mode answer a different question.
     albums.iter().all(|a| a.ctdb_first == opts.ctdb_first)
+        // Probing again is cheap, and newer versions may open more files
+        // or read more of their parameters.
+        && albums.iter().all(|a| !probe_incomplete(&a.reason))
         && albums
             .iter()
             .flat_map(|a| &a.tracks)
@@ -595,6 +598,15 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
                 TrackStatus::AccurateTag => opts.use_tags,
                 _ => true,
             })
+}
+
+/// Whether an ineligible album's `reason` blames a file that couldn't be
+/// opened, or a format parameter that couldn't be read (shown as 0).
+fn probe_incomplete(reason: &str) -> bool {
+    reason.starts_with(crate::scan::CANNOT_DECODE)
+        || reason
+            .strip_prefix(NOT_CD_QUALITY)
+            .is_some_and(|r| r.contains("(0 Hz") || r.contains(" 0 bit") || r.contains(" 0 ch"))
 }
 
 /// The AccurateRip result for an --invert check: `ar` if given, else a fresh

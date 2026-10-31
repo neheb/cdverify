@@ -6,6 +6,7 @@ use std::fs::File;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_FLAC, CODEC_ID_VORBIS};
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
@@ -20,6 +21,19 @@ pub struct Opened {
     pub decoder: Box<dyn AudioDecoder>,
     pub track_id: u32,
 }
+
+/// [`open`]'s error for a lossy stream, such as AAC in an `.m4a` file
+/// (which may also hold lossless ALAC).
+#[derive(Debug)]
+pub struct LossyCodec;
+
+impl std::fmt::Display for LossyCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("lossy codec")
+    }
+}
+
+impl std::error::Error for LossyCodec {}
 
 /// Probes a file and creates a decoder for its default audio track.
 pub fn open(path: &Path, verify: bool) -> Result<Opened> {
@@ -49,6 +63,11 @@ pub fn open(path: &Path, verify: bool) -> Result<Opened> {
         .as_ref()
         .and_then(|p| p.audio())
         .ok_or_else(|| anyhow!("no audio codec parameters"))?;
+    // Symphonia numbers every lossy codec from Vorbis up to FLAC, the first
+    // lossless one.
+    if (CODEC_ID_VORBIS..CODEC_ID_FLAC).contains(&params.codec) {
+        return Err(LossyCodec.into());
+    }
     let opts = AudioDecoderOptions::default().verify(verify);
     let decoder = symphonia::default::get_codecs().make_audio_decoder(params, &opts)?;
     let track_id = track.id;

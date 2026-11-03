@@ -340,11 +340,25 @@ pub fn group(dir: &Path, tracks: Vec<TrackInfo>) -> Vec<AlbumJob> {
             .or_default()
             .push(t);
     }
-    // Files whose tags couldn't be read (lossy etc.) join the only tagged
-    // album when there is exactly one.
+    // Files whose tags couldn't be read (e.g. damaged ones) join the only
+    // tagged album when there is exactly one and they share its file type;
+    // other files (say, lossy copies alongside) stay an album of their own.
+    let ext = |t: &TrackInfo| {
+        t.path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    };
     if groups.len() == 2 && groups.contains_key(&(None, None, None)) {
-        let untagged = groups.remove(&(None, None, None)).unwrap();
-        groups.values_mut().next().unwrap().extend(untagged);
+        let untagged = &groups[&(None, None, None)];
+        let (_, tagged) = groups
+            .iter()
+            .find(|(k, _)| **k != (None, None, None))
+            .unwrap();
+        let exts: Vec<_> = tagged.iter().map(ext).collect();
+        if untagged.iter().all(|t| exts.contains(&ext(t))) {
+            let untagged = groups.remove(&(None, None, None)).unwrap();
+            groups.values_mut().next().unwrap().extend(untagged);
+        }
     }
     // Images that would otherwise share a title are told apart by file name.
     let shared = |album: &Option<String>, disc: Option<u32>| {

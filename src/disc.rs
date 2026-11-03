@@ -102,16 +102,36 @@ impl DiscId {
 ///
 /// `start` is where track 1 begins (0 unless there's an unripped pregap).
 pub fn musicbrainz_id(sectors: &[u32], start: u32) -> String {
+    musicbrainz_toc_id(
+        &audio_starts(sectors, start),
+        start + sectors.iter().sum::<u32>(),
+    )
+}
+
+/// MusicBrainz disc ID of a mixed-mode CD: data track 1 at LBA 0, then the
+/// audio tracks from `audio_start`, with the lead-out at `leadout`. Unlike an
+/// Enhanced CD's trailing data track, a leading one counts as track 1.
+pub fn musicbrainz_id_leading_data(sectors: &[u32], audio_start: u32, leadout: u32) -> String {
+    let starts: Vec<u32> = std::iter::once(0)
+        .chain(audio_starts(sectors, audio_start))
+        .collect();
+    musicbrainz_toc_id(&starts, leadout)
+}
+
+fn audio_starts(sectors: &[u32], start: u32) -> Vec<u32> {
+    audio_offsets(sectors).iter().map(|o| o + start).collect()
+}
+
+/// MusicBrainz disc ID of tracks 1.. starting at `starts` (LBAs).
+fn musicbrainz_toc_id(starts: &[u32], leadout: u32) -> String {
     use sha1::{Digest, Sha1};
 
     let mut offsets = [0u32; 100];
-    let mut pos = 150 + start;
-    for (i, &len) in sectors.iter().take(99).enumerate() {
-        offsets[i + 1] = pos;
-        pos += len;
+    for (i, &s) in starts.iter().take(99).enumerate() {
+        offsets[i + 1] = s + 150;
     }
-    offsets[0] = pos;
-    let mut toc = format!("{:02X}{:02X}", 1, sectors.len());
+    offsets[0] = leadout + 150;
+    let mut toc = format!("{:02X}{:02X}", 1, starts.len().min(99));
     for off in offsets {
         toc.push_str(&format!("{off:08X}"));
     }
@@ -235,6 +255,15 @@ mod tests {
         let id = DiscId::with_pregap(&sectors, 37);
         assert_eq!(id.file_name(), "dBAR-008-00099162-003e0aa7-7106d808.bin");
         assert_eq!(musicbrainz_id(&sectors, 37), "9Ogj41zvgLsTmazs4l2NqkkkG8Q-");
+    }
+
+    #[test]
+    fn musicbrainz_leading_data_track() {
+        // Data track 1 counts like any other track 1.
+        let audio = [20000, 15000, 18000];
+        let id = musicbrainz_id_leading_data(&audio, 30000, 30000 + 53000);
+        assert_eq!(id, musicbrainz_id(&[30000, 20000, 15000, 18000], 0));
+        assert_ne!(id, musicbrainz_id(&audio, 30000));
     }
 
     #[test]

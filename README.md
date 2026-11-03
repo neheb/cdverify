@@ -45,7 +45,7 @@ Releases are built by GitHub Actions when a `v*` tag is pushed
 cargo run --release -- ~/Music
 ```
 
-Keys: `←/→`, `Tab` or `1`–`4` switch list · `↑/↓` select · `PgUp/PgDn` page through
+Keys: `←/→`, `Tab` or `1`–`5` switch list · `↑/↓` select · `PgUp/PgDn` page through
 albums · `c` copy the album's MusicBrainz URL · `r` repair · `e` export report ·
 `q` quit. `Esc` only clears the status message.
 
@@ -58,7 +58,7 @@ Mouse: click a list name or an album to select it. The wheel moves through album
 
 Options:
 
-- `--min-confidence N`: require confidence N (use 2 if you submit your own rips).
+- `--min-confidence N`: require confidence N (use 2 if you submit your own rips). This also applies to `ACCURATERIPRESULT` tags: an album whose tags report a lower confidence is decoded and checked.
 - `--no-tag`: ignore dBpoweramp `ACCURATERIPRESULT` tags and always decode.
 - `--offset-range N`: pressing-offset search range in samples (default 2939, 0 disables it).
 - `--skip-non-cd`: hide lossy and non-44.1 kHz/16-bit albums.
@@ -84,6 +84,8 @@ Options:
   3. Accepts the fix only if the corrected audio's CRC32 matches CTDB's.
   4. Writes corrected copies of just the damaged tracks to `DIR` (default `~/accuraterip-repaired`), mirroring the library's folders. FLAC tags and pictures are kept.
 
+  Repaired copies can be written for FLAC and WAV files only; AIFF and ALAC albums can be checked against CTDB, but not repaired.
+
   Your library is never modified. It encodes with `flac` if installed, otherwise with the built-in encoder. Each written file is decoded again and compared before it's kept. Repair can fix damaged samples (up to about a second of damage in total), but not a *sample slip*, where the drive lost sync and added or dropped samples. Those show up as accurate tracks on either side matching at different offsets; the tool points out the track to re-rip.
 - **Pressing offsets.** If some tracks don't match, the tool computes the frame-450 checksum at every offset within ±range. Offsets where it matches the database get the full checksums recomputed at that offset. This finds rips of a different pressing of the same CD.
 - **Formats.** Decoding uses [Symphonia](https://github.com/pdeljanov/Symphonia): FLAC, WAV, AIFF, and ALAC in `.m4a`.
@@ -95,9 +97,10 @@ changed. A folder is reused when all of its audio files have the same names,
 sizes and modification times. Only final results are cached:
 
 - Accurately Ripped albums.
+- Ripping errors, with their CTDB repair verdict.
 - Cannot Check albums for permanent reasons: lossy, not CD quality, or incomplete.
 
-Ripping errors, Not Found albums, corrupted tracks and failed lookups are checked again on every run. The database gains submissions over time, and a corruption seen over a network share may be a temporary read error. A cached Accurate result is also re-checked when it no longer meets `--min-confidence`, or when it came from a tag and `--no-tag` is given.
+Not Found albums, corrupted tracks and failed lookups (AccurateRip or CTDB) are checked again on every run. The database gains submissions over time, and a corruption seen over a network share may be a temporary read error. A cached result is also re-checked when an Accurate track no longer meets `--min-confidence`, when it came from a tag and `--no-tag` is given, when `--offset-range` changed, or when it was made with `--no-ctdb` and CTDB is now in use.
 
 ## Limitations
 

@@ -245,11 +245,15 @@ pub fn ctdb_exact(db: &Db, toc: &str) -> Result<Vec<CtdbEntry>> {
         .collect())
 }
 
-/// Downloads a CTDB parity file.
+/// Downloads a CTDB parity file. These run to megabytes, so they get longer
+/// than the agent's 20 s lookup timeout.
 pub fn fetch(db: &Db, url: &str) -> Result<Vec<u8>> {
     Ok(db
         .agent
         .get(url)
+        .config()
+        .timeout_global(Some(Duration::from_secs(180)))
+        .build()
         .call()?
         .body_mut()
         .with_config()

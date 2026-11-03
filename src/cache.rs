@@ -136,6 +136,29 @@ impl Cache {
         update(self.entries_mut(false), dir, files, albums);
     }
 
+    /// Changes one cached album of `dir` in this mode's entries, forgetting
+    /// the folder if the album then needs rechecking. Returns whether it was
+    /// cached.
+    pub fn update_album(
+        &mut self,
+        dir: &Path,
+        title: &str,
+        f: impl FnOnce(&mut AlbumResult),
+    ) -> bool {
+        let entries = self.entries_mut(false);
+        let Some(e) = entries.get_mut(dir) else {
+            return false;
+        };
+        let Some(a) = e.albums.iter_mut().find(|a| a.title == title) else {
+            return false;
+        };
+        f(a);
+        if a.recheck {
+            entries.remove(dir);
+        }
+        true
+    }
+
     /// Like [`Cache::update`], for the other mode (`--both`).
     pub fn update_other(
         &mut self,
@@ -215,6 +238,8 @@ mod tests {
             repair: None,
             diagnosis: None,
             ctdb_first: false,
+            without_ctdb: false,
+            offset_range: None,
         }
     }
 

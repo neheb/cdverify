@@ -82,7 +82,8 @@ fn parse_flac_block(data: &[u8]) -> Option<Vec<CueTrack>> {
 
 /// Parses a text CUE sheet describing a single file. Returns `None` for
 /// sheets with no audio tracks or more than one `FILE` (one file per track
-/// isn't an image).
+/// isn't an image). A malformed `TRACK` or `INDEX 01` line drops only that
+/// track, which leaves a gap in the numbering that the album check reports.
 pub fn parse_text(text: &str) -> Option<Vec<CueTrack>> {
     let mut files = 0;
     let mut tracks = Vec::new();
@@ -92,20 +93,21 @@ pub fn parse_text(text: &str) -> Option<Vec<CueTrack>> {
         match words.next().map(str::to_ascii_uppercase).as_deref() {
             Some("FILE") => files += 1,
             Some("TRACK") => {
-                let number = words.next()?.parse().ok()?;
-                let audio = words
-                    .next()
-                    .is_some_and(|t| t.eq_ignore_ascii_case("AUDIO"));
-                current = Some((number, audio));
+                current = words.next().and_then(|n| n.parse().ok()).map(|number| {
+                    let audio = words
+                        .next()
+                        .is_some_and(|t| t.eq_ignore_ascii_case("AUDIO"));
+                    (number, audio)
+                });
             }
             Some("INDEX") => {
-                let idx: u32 = words.next()?.parse().ok()?;
-                if idx == 1
+                if words.next().and_then(|i| i.parse::<u32>().ok()) == Some(1)
                     && let Some((number, true)) = current
+                    && let Some(start) = words.next().and_then(msf)
                 {
                     tracks.push(CueTrack {
                         number,
-                        start: msf(words.next()?)? * SECTOR_FRAMES,
+                        start: start * SECTOR_FRAMES,
                     });
                 }
             }
@@ -169,6 +171,15 @@ mod tests {
             ])
         );
         assert_eq!(file_name(text).as_deref(), Some("Some Album.wav"));
+    }
+
+    #[test]
+    fn skips_malformed_lines() {
+        let text = "FILE \"a.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n\
+                    TRACK 02 AUDIO\nINDEX 01 bogus\nTRACK xx AUDIO\nINDEX 01 00:09:00\n\
+                    TRACK 04 AUDIO\nINDEX 01 00:12:00\n";
+        let numbers: Vec<u32> = parse_text(text).unwrap().iter().map(|t| t.number).collect();
+        assert_eq!(numbers, [1, 4]);
     }
 
     #[test]

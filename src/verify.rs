@@ -149,6 +149,14 @@ pub struct AlbumResult {
     /// Checked with `--invert` (CTDB first).
     #[serde(default)]
     pub ctdb_first: bool,
+    /// Checked by decoding with `--no-ctdb`: no layout lookups or repair
+    /// check, which a run with CTDB has to make up for.
+    #[serde(default)]
+    pub without_ctdb: bool,
+    /// `--offset-range` of a check that decoded the album (`None` for older
+    /// cache entries and albums that weren't decoded).
+    #[serde(default)]
+    pub offset_range: Option<i64>,
 }
 
 impl AlbumResult {
@@ -157,6 +165,28 @@ impl AlbumResult {
             .as_ref()
             .map(|id| format!("https://musicbrainz.org/cdtoc/{id}"))
     }
+}
+
+/// The result for a folder whose check panicked.
+pub fn internal_error(
+    dir: &Path,
+    title: String,
+    panic: &(dyn std::any::Any + Send),
+) -> AlbumResult {
+    let what = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("panic");
+    let job = AlbumJob {
+        dir: dir.to_path_buf(),
+        title,
+        tracks: Vec::new(),
+    };
+    let mut result = blank_result(&job);
+    result.reason = format!("Internal error: {what}");
+    result.recheck = true;
+    result
 }
 
 pub type Progress<'a> = &'a mut dyn FnMut(f32);
@@ -183,6 +213,8 @@ fn blank_result(job: &AlbumJob) -> AlbumResult {
         repair: None,
         diagnosis: None,
         ctdb_first: false,
+        without_ctdb: false,
+        offset_range: None,
         tracks: job
             .tracks
             .iter()
@@ -229,7 +261,33 @@ fn image_layout(job: &AlbumJob) -> Option<TocLayout> {
 
 /// Sets the MusicBrainz disc ID for track 1 at `start`, flagging a differing tag.
 fn set_mb_id(job: &AlbumJob, result: &mut AlbumResult, sectors: &[u32], start: u32) {
-    let mb_id = disc::musicbrainz_id(sectors, start);
+    set_mb_disc_id(job, result, disc::musicbrainz_id(sectors, start));
+}
+
+/// Sets the MusicBrainz disc ID for the disc's real layout. An Enhanced CD's
+/// trailing data track isn't part of its MusicBrainz ID (the lead-out is the
+/// end of the audio session), so only a pregap or a leading data track
+/// changes it.
+fn set_mb_id_for_layout(
+    job: &AlbumJob,
+    result: &mut AlbumResult,
+    sectors: &[u32],
+    layout: TocLayout,
+) {
+    match layout {
+        TocLayout::Pregap { start } => set_mb_id(job, result, sectors, start),
+        TocLayout::DataFirst {
+            audio_start,
+            leadout,
+        } => {
+            let id = disc::musicbrainz_id_leading_data(sectors, audio_start, leadout);
+            set_mb_disc_id(job, result, id);
+        }
+        TocLayout::DataLast { .. } => {}
+    }
+}
+
+fn set_mb_disc_id(job: &AlbumJob, result: &mut AlbumResult, mb_id: String) {
     result.mb_tag_mismatch = job
         .tracks
         .iter()
@@ -264,6 +322,8 @@ pub fn verify_with(
             .iter()
             .map(|t| t.ar_result.as_deref().and_then(tag_confidence))
             .collect();
+        // Tags below the threshold don't settle it: decode and check.
+        let tagged = tagged.filter(|c| c.iter().all(|&c| c >= opts.min_confidence.max(1)));
         if let Some(confs) = tagged {
             for (t, c) in result.tracks.iter_mut().zip(confs) {
                 t.status = TrackStatus::AccurateTag;
@@ -275,6 +335,8 @@ pub fn verify_with(
         }
     }
 
+    result.without_ctdb = !opts.use_ctdb;
+    result.offset_range = Some(opts.offset_range);
     let bounds: Arc<[u64]> = std::iter::once(0)
         .chain(sectors.iter().scan(0u64, |acc, &s| {
             *acc += s as u64 * SECTOR_FRAMES;
@@ -306,6 +368,11 @@ pub fn verify_with(
         }
         for a in early.iter_mut() {
             a.push(pos, frames);
+        }
+        // The buffer is replayed from position 0, so it only holds a
+        // gapless prefix; a track that decoded short ends the buffering.
+        if buffer.as_ref().is_some_and(|b| b.len() as u64 != pos) {
+            buffer = None;
         }
         if let (Some(buf), Some(p)) = (buffer.as_mut(), pressings.as_deref()) {
             buf.extend_from_slice(frames);
@@ -446,11 +513,8 @@ pub fn verify_with(
                 result.disc_id = Some(m.id.file_name());
                 result.url = Some(m.id.url());
                 result.data_track = Some(m.note);
-                match m.layout {
-                    TocLayout::DataFirst { .. } => data_first = true,
-                    TocLayout::Pregap { start } => set_mb_id(job, &mut result, &sectors, start),
-                    TocLayout::DataLast { .. } => {}
-                }
+                data_first = matches!(m.layout, TocLayout::DataFirst { .. });
+                set_mb_id_for_layout(job, &mut result, &sectors, m.layout);
             }
             pressings = Some(p);
             eval
@@ -590,12 +654,19 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
         // Probing again is cheap, and newer versions may open more files
         // or read more of their parameters.
         && albums.iter().all(|a| !probe_incomplete(&a.reason))
+        // A check without CTDB skipped layout lookups and the repair check.
+        && albums.iter().all(|a| !(a.without_ctdb && opts.use_ctdb))
+        && albums
+            .iter()
+            .all(|a| a.offset_range.is_none_or(|r| r == opts.offset_range))
         && albums
             .iter()
             .flat_map(|a| &a.tracks)
             .all(|t| match t.status {
                 TrackStatus::Accurate => t.confidence >= opts.min_confidence,
-                TrackStatus::AccurateTag => opts.use_tags,
+                TrackStatus::AccurateTag => {
+                    opts.use_tags && t.confidence >= opts.min_confidence.max(1)
+                }
                 _ => true,
             })
 }
@@ -711,9 +782,7 @@ pub fn verify_ctdb_first(
         result.disc_id = Some(id.file_name());
         result.url = Some(id.url());
         result.data_track = Some(note);
-        if let TocLayout::Pregap { start } = layout {
-            set_mb_id(job, &mut result, &sectors, start);
-        }
+        set_mb_id_for_layout(job, &mut result, &sectors, layout);
     }
     for t in &mut result.tracks {
         t.status = TrackStatus::AccurateCtdb;
@@ -1091,6 +1160,45 @@ mod tests {
             track(3, 42, Accurate),
         ];
         assert_eq!(sample_slip(&plain), None);
+    }
+
+    #[test]
+    fn cache_respects_ctdb_and_offset_range() {
+        let opts = Options {
+            min_confidence: 1,
+            use_tags: true,
+            offset_range: 2939,
+            max_candidates: 4,
+            use_ctdb: true,
+            ctdb_first: false,
+        };
+        let job = AlbumJob {
+            dir: PathBuf::new(),
+            title: String::new(),
+            tracks: Vec::new(),
+        };
+        let mut a = blank_result(&job);
+        assert!(cached_valid(std::slice::from_ref(&a), &opts));
+        a.without_ctdb = true;
+        assert!(!cached_valid(std::slice::from_ref(&a), &opts));
+        let no_ctdb = Options {
+            use_ctdb: false,
+            ..opts
+        };
+        assert!(cached_valid(std::slice::from_ref(&a), &no_ctdb));
+        a.without_ctdb = false;
+        a.offset_range = Some(100);
+        assert!(!cached_valid(std::slice::from_ref(&a), &opts));
+        a.offset_range = Some(2939);
+        assert!(cached_valid(std::slice::from_ref(&a), &opts));
+        let mut tag = track(1, 0, TrackStatus::AccurateTag);
+        tag.confidence = 1;
+        a.tracks = vec![tag];
+        let strict = Options {
+            min_confidence: 2,
+            ..opts
+        };
+        assert!(!cached_valid(std::slice::from_ref(&a), &strict));
     }
 
     #[test]

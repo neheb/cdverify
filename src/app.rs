@@ -31,7 +31,8 @@ pub enum Event {
         dir: PathBuf,
         title: String,
         msg: String,
-        done: bool,
+        /// Set once the repair is finished.
+        outcome: Option<crate::repair::Outcome>,
     },
     Done {
         worker: usize,
@@ -135,16 +136,23 @@ impl App {
                 dir,
                 title,
                 msg,
-                done,
+                outcome,
             } => {
-                if done {
+                if let Some(outcome) = outcome {
                     self.repairing = false;
                     if let Some(a) = self
                         .albums
                         .iter_mut()
                         .find(|a| a.dir == dir && a.title == title)
                     {
-                        a.repair = Some(msg.clone());
+                        apply_repair(a, outcome, msg.clone());
+                    }
+                    let found = self.cache.update_album(&dir, &title, |a| {
+                        apply_repair(a, outcome, msg.clone());
+                    });
+                    if found {
+                        self.cache_dirty = true;
+                        self.save_cache();
                     }
                 }
                 self.message = Some(msg);
@@ -288,9 +296,19 @@ impl App {
         let (Some(r), Some(album)) = (&self.repairer, self.selected()) else {
             return;
         };
-        if album.repair_outcome == Some(crate::repair::Outcome::Verified) {
-            self.message = Some("This rip matches CTDB exactly; there's nothing to repair".into());
-            return;
+        match album.repair_outcome {
+            Some(crate::repair::Outcome::Verified) => {
+                self.message =
+                    Some("This rip matches CTDB exactly; there's nothing to repair".into());
+                return;
+            }
+            Some(crate::repair::Outcome::Repaired) => {
+                self.message = Some(
+                    "A repaired copy was already written (use --rescan to check again)".into(),
+                );
+                return;
+            }
+            _ => {}
         }
         let Some(toc) = album.ctdb_toc.clone() else {
             self.message = Some("This album can't be repaired (not checked against CTDB)".into());
@@ -321,16 +339,16 @@ impl App {
                         dir: dir.clone(),
                         title: title.clone(),
                         msg,
-                        done: false,
+                        outcome: None,
                     });
                 }
             };
-            let (_, msg) = crate::repair::run(&job, &toc, &db, Some(&dest), &mut progress);
+            let (outcome, msg) = crate::repair::run(&job, &toc, &db, Some(&dest), &mut progress);
             let _ = tx.send(Event::Repair {
                 dir,
                 title,
                 msg,
-                done: true,
+                outcome: Some(outcome),
             });
         });
     }
@@ -414,6 +432,23 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Records a CTDB repair attempt's outcome in an album's result, replacing
+/// the note of an earlier check in its reason.
+fn apply_repair(a: &mut AlbumResult, outcome: crate::repair::Outcome, msg: String) {
+    let note = outcome.verdict_note();
+    match a.repair_outcome.map(|o| o.verdict_note()) {
+        Some(old) if a.reason.contains(old) => a.reason = a.reason.replacen(old, note, 1),
+        _ if a.verdict == Verdict::RipErrors => a.reason = format!("{}; {note}", a.reason),
+        _ => {}
+    }
+    // As in the scan: a failed check is worth retrying next run.
+    if outcome == crate::repair::Outcome::Failed {
+        a.recheck = true;
+    }
+    a.repair_outcome = Some(outcome);
+    a.repair = Some(msg);
 }
 
 pub fn is_non_cd(a: &AlbumResult) -> bool {

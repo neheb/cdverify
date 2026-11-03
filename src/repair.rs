@@ -301,6 +301,11 @@ impl Pass {
                 statuses.push(not("different parity stride"));
                 continue;
             }
+            // Without CTDB's CRC32 neither a match nor a repair can be confirmed.
+            let Some(crc32) = e.crc32 else {
+                statuses.push(not("CTDB's entry has no CRC32 to check against"));
+                continue;
+            };
             let Some(head) = entry_syndrome(e) else {
                 statuses.push(not("no syndrome"));
                 continue;
@@ -309,7 +314,7 @@ impl Pass {
                 statuses.push(not("too different from this rip"));
                 continue;
             };
-            if exact && window_crc(offset, &[]) == e.crc32 {
+            if exact && window_crc(offset, &[]) == Some(crc32) {
                 statuses.push(EntryStatus::Verified {
                     confidence: conf,
                     offset,
@@ -332,7 +337,7 @@ impl Pass {
             }
             match parity::compute_fixes(&enc, &full, npar, offset) {
                 None => statuses.push(not("too much damage for the repair data")),
-                Some(fixes) if window_crc(offset, &fixes) != e.crc32 => {
+                Some(fixes) if window_crc(offset, &fixes) != Some(crc32) => {
                     statuses.push(not("corrected audio fails CTDB's CRC check"))
                 }
                 Some(fixes) => {

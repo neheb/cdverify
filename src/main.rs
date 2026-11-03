@@ -115,19 +115,21 @@ fn main() -> Result<()> {
     // Canonicalize so cache keys don't depend on how the path was typed.
     let root = std::fs::canonicalize(&cli.dir).unwrap_or_else(|_| cli.dir.clone());
     let db = Arc::new(Db::new());
-    let repairer = app::Repairer {
+    // Headless mode has no `r` key, and the repairer's sender would keep the
+    // channel open after the workers are gone.
+    let repairer = (!cli.headless).then(|| app::Repairer {
         tx: tx.clone(),
         db: db.clone(),
         root: root.clone(),
         out: cli.repair.clone().unwrap_or_else(repair::default_out),
-    };
+    });
     // Work out both modes' results (normal and --invert) so a later run in
     // either mode comes from the cache; without CTDB there's only one.
     let both = !cli.no_ctdb;
     start(root, threads, opts, both, prior, repair_opts, db, tx);
 
     let mut app = App::new(cli.report.clone(), cli.skip_non_cd, cache, cache_path);
-    app.repairer = Some(repairer);
+    app.repairer = repairer;
     if cli.headless {
         run_headless(&mut app, rx)
     } else {
@@ -360,37 +362,52 @@ fn start(
                         .unwrap_or(&dir)
                         .display()
                         .to_string();
-                    let _ = tx.send(Event::Started { worker, label });
-                    let tracks = scan::probe_files(&files);
-                    let jobs = scan::group(&dir, tracks);
-                    let n = jobs.len() as f32;
-                    // A mode that is cached is reused album by album, if the
-                    // albums still line up with this folder's.
-                    let lined_up = |a: Option<Vec<verify::AlbumResult>>| {
-                        a.filter(|a| {
-                            a.len() == jobs.len()
-                                && a.iter().zip(&jobs).all(|(r, j)| r.title == j.title)
-                        })
-                        .map(Vec::into_iter)
+                    let _ = tx.send(Event::Started {
+                        worker,
+                        label: label.clone(),
+                    });
+                    // A panic (say, in a decoder) costs this folder only, and
+                    // its Done still arrives so the run can finish.
+                    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let tracks = scan::probe_files(&files);
+                        let jobs = scan::group(&dir, tracks);
+                        let n = jobs.len() as f32;
+                        // A mode that is cached is reused album by album, if the
+                        // albums still line up with this folder's.
+                        let lined_up = |a: Option<Vec<verify::AlbumResult>>| {
+                            a.filter(|a| {
+                                a.len() == jobs.len()
+                                    && a.iter().zip(&jobs).all(|(r, j)| r.title == j.title)
+                            })
+                            .map(Vec::into_iter)
+                        };
+                        let (mut hit, mut other_hit) = (lined_up(hit), lined_up(other_hit));
+                        let (albums, other): (Vec<_>, Vec<_>) = jobs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, job)| {
+                                let mut progress = |frac: f32| {
+                                    let _ = tx.send(Event::Progress {
+                                        worker,
+                                        frac: (i as f32 + frac) / n,
+                                    });
+                                };
+                                let prev = (
+                                    hit.as_mut().and_then(Iterator::next),
+                                    other_hit.as_mut().and_then(Iterator::next),
+                                );
+                                check_album(job, &root, &db, &opts, both, &ro, prev, &mut progress)
+                            })
+                            .unzip();
+                        (albums, other)
+                    }));
+                    let (albums, other, stamps) = match checked {
+                        Ok((albums, other)) => (albums, other, stamps),
+                        Err(panic) => {
+                            let album = verify::internal_error(&dir, label, &*panic);
+                            (vec![album], Vec::new(), None)
+                        }
                     };
-                    let (mut hit, mut other_hit) = (lined_up(hit), lined_up(other_hit));
-                    let (albums, other): (Vec<_>, Vec<_>) = jobs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, job)| {
-                            let mut progress = |frac: f32| {
-                                let _ = tx.send(Event::Progress {
-                                    worker,
-                                    frac: (i as f32 + frac) / n,
-                                });
-                            };
-                            let prev = (
-                                hit.as_mut().and_then(Iterator::next),
-                                other_hit.as_mut().and_then(Iterator::next),
-                            );
-                            check_album(job, &root, &db, &opts, both, &ro, prev, &mut progress)
-                        })
-                        .unzip();
                     let _ = tx.send(Event::Done {
                         worker,
                         dir,
@@ -445,6 +462,9 @@ fn run_headless(app: &mut App, rx: Receiver<Event>) -> Result<()> {
             }
         }
         app.handle(ev);
+    }
+    if !app.finished() {
+        eprintln!("Workers stopped before every folder was checked");
     }
     app.save_cache();
     let (json, txt) = report::write(&app.report_path, &app.albums)?;

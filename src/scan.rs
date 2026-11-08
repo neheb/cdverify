@@ -49,12 +49,20 @@ fn is_cue(path: &Path) -> bool {
 /// sorted by name.
 pub fn find_folders(root: &Path) -> Vec<(PathBuf, Vec<PathBuf>)> {
     let mut map: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    // A folder reachable through symlinks under several paths is listed
+    // once, under the first path the walk finds.
+    let mut seen: std::collections::HashMap<PathBuf, PathBuf> = Default::default();
     for entry in WalkDir::new(root).follow_links(true).into_iter().flatten() {
         let path = entry.path();
         if entry.file_type().is_file()
             && (audio_kind(path).is_some() || is_cue(path))
             && let Some(dir) = path.parent()
         {
+            let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            let first = seen.entry(canon).or_insert_with(|| dir.to_path_buf());
+            if first != dir {
+                continue;
+            }
             map.entry(dir.to_path_buf())
                 .or_default()
                 .push(path.to_path_buf());
@@ -296,17 +304,25 @@ fn read_tags(rev: &MetadataRevision, info: &mut TrackInfo) {
 }
 
 /// Track number from names like "07 - Title" or "1.07 - Title" / "1-07 Title".
+/// Longer numbers (years, dates like "2024-09-01") aren't track numbers.
 fn number_from_name(path: &Path) -> Option<u32> {
     let name = path.file_stem()?.to_str()?;
     let lead: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
     let rest = &name[lead.len()..];
-    if let Some(after) = rest.strip_prefix(['.', '-']) {
+    if lead.len() <= 2
+        && let Some(after) = rest.strip_prefix(['.', '-'])
+    {
         let second: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if !second.is_empty() {
+        if (1..=2).contains(&second.len()) {
             return second.parse().ok();
         }
     }
-    lead.parse().ok()
+    // "101 Title" is disc 1, track 01.
+    match lead.len() {
+        1 | 2 => lead.parse().ok(),
+        3 => lead[1..].parse().ok(),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -455,5 +471,8 @@ mod tests {
         assert_eq!(number_from_name(Path::new("1.02 - Tank!.flac")), Some(2));
         assert_eq!(number_from_name(Path::new("2-11 Song.flac")), Some(11));
         assert_eq!(number_from_name(Path::new("Song.flac")), None);
+        assert_eq!(number_from_name(Path::new("2024-09-01 Song.flac")), None);
+        assert_eq!(number_from_name(Path::new("1999 Song.flac")), None);
+        assert_eq!(number_from_name(Path::new("203 Song.flac")), Some(3));
     }
 }

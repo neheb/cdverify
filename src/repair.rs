@@ -325,7 +325,7 @@ impl Pass {
                 statuses.push(not("differs, and CTDB has no repair data for it"));
                 continue;
             };
-            let npar = e.npar.unwrap_or(MAX_NPAR).min(MAX_NPAR);
+            let npar = entry_npar(e);
             let bytes = db::fetch(db, url).context("downloading CTDB parity")?;
             let Some(full) = parity::bytes_to_syndrome(geo.stride, npar, &bytes) else {
                 statuses.push(not("parity file too short"));
@@ -371,11 +371,16 @@ impl Pass {
     }
 }
 
+/// The entry's parity words per column. Entries without `npar` are old
+/// ones, which always used 8.
+fn entry_npar(e: &CtdbEntry) -> usize {
+    e.npar.unwrap_or(8).min(MAX_NPAR)
+}
+
 /// The entry's first-column syndrome (`npar` words).
 fn entry_syndrome(e: &CtdbEntry) -> Option<Vec<u16>> {
-    let npar = e.npar.unwrap_or(8).min(MAX_NPAR);
     match (&e.syndrome, &e.parity) {
-        (Some(s), _) => parity::bytes_to_syndrome(1, npar, &db::base64_decode(s)?),
+        (Some(s), _) => parity::bytes_to_syndrome(1, entry_npar(e), &db::base64_decode(s)?),
         (None, Some(p)) => parity::parity_bytes_to_syndrome(8, &db::base64_decode(p)?),
         _ => None,
     }

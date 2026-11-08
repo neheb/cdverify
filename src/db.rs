@@ -109,6 +109,9 @@ pub enum TocLayout {
     Pregap { start: u32 },
 }
 
+/// Largest parity stride (in frames) accepted from CTDB; CTDB uses 5880.
+pub const MAX_STRIDE: usize = 1 << 16;
+
 /// One CTDB entry (a set of agreeing submissions) for a disc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CtdbEntry {
@@ -168,8 +171,13 @@ fn parse_ctdb_entries(xml: &str) -> Vec<CtdbEntry> {
             toc: toc.to_string(),
             has_parity: attr("hasparity").is_some_and(|p| !p.is_empty()),
             crc32: attr("crc32").and_then(|c| u32::from_str_radix(c, 16).ok()),
-            stride: attr("stride").and_then(|s| s.parse().ok()),
-            npar: attr("npar").and_then(|s| s.parse().ok()),
+            // These size the parity pass, so nonsense is dropped here.
+            stride: attr("stride")
+                .and_then(|s| s.parse().ok())
+                .filter(|s| (1..=MAX_STRIDE).contains(s)),
+            npar: attr("npar")
+                .and_then(|s| s.parse().ok())
+                .filter(|n| (1..=crate::parity::MAX_NPAR).contains(n)),
             syndrome: attr("syndrome").map(str::to_string),
             parity: attr("parity").map(str::to_string),
             parity_url: attr("hasparity").filter(|p| !p.is_empty()).map(|p| {
@@ -277,6 +285,10 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
         .collect();
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
     for chunk in bytes.chunks(4) {
+        // A lone trailing character can't encode a byte.
+        if chunk.len() == 1 {
+            return None;
+        }
         let mut n = 0u32;
         for (i, &c) in chunk.iter().enumerate() {
             n |= (val(c)? as u32) << (18 - 6 * i);
@@ -433,12 +445,27 @@ mod tests {
 </ctdb>"#;
         assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
         assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
+        assert_eq!(base64_decode("Zm9vY"), None);
         let e = parse_ctdb_entries(xml);
         assert_eq!(
             e.iter()
                 .map(|e| (e.confidence, e.has_parity))
                 .collect::<Vec<_>>(),
             [(483, true), (1, false), (2, false)]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_ctdb_geometry() {
+        let xml = r#"<ctdb>
+ <entry confidence="1" stride="0" npar="0" toc="0:5:9" />
+ <entry confidence="1" stride="5880" npar="99" toc="0:5:9" />
+ <entry confidence="1" stride="5880" npar="16" toc="0:5:9" />
+</ctdb>"#;
+        let e = parse_ctdb_entries(xml);
+        assert_eq!(
+            e.iter().map(|e| (e.stride, e.npar)).collect::<Vec<_>>(),
+            [(None, None), (Some(5880), None), (Some(5880), Some(16))]
         );
     }
 

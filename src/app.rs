@@ -152,7 +152,7 @@ impl App {
                     });
                     if found {
                         self.cache_dirty = true;
-                        self.save_cache();
+                        let _ = self.save_cache();
                     }
                 }
                 self.message = Some(msg);
@@ -177,7 +177,7 @@ impl App {
                     self.cache_dirty = true;
                 }
                 if self.finished() {
-                    self.save_cache();
+                    let _ = self.save_cache();
                 }
                 for a in albums {
                     if self.skip_non_cd && is_non_cd(&a) {
@@ -189,14 +189,22 @@ impl App {
         }
     }
 
-    /// Writes the cache if it changed since the last save.
-    pub fn save_cache(&mut self) {
+    /// Writes the cache if it changed since the last save. On failure the
+    /// error is also shown as the status message.
+    pub fn save_cache(&mut self) -> Result<(), String> {
         if !self.cache_dirty {
-            return;
+            return Ok(());
         }
         match self.cache.save(&self.cache_path) {
-            Ok(()) => self.cache_dirty = false,
-            Err(e) => self.message = Some(format!("Saving cache failed: {e}")),
+            Ok(()) => {
+                self.cache_dirty = false;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("Saving cache to {} failed: {e}", self.cache_path.display());
+                self.message = Some(msg.clone());
+                Err(msg)
+            }
         }
     }
 
@@ -308,6 +316,11 @@ impl App {
                 );
                 return;
             }
+            // Only an album that CTDB itself flagged gets checked again.
+            None if album.verdict == Verdict::Accurate => {
+                self.message = Some("This rip is accurate; there's nothing to repair".into());
+                return;
+            }
             _ => {}
         }
         let Some(toc) = album.ctdb_toc.clone() else {
@@ -343,7 +356,16 @@ impl App {
                     });
                 }
             };
-            let (outcome, msg) = crate::repair::run(&job, &toc, &db, Some(&dest), &mut progress);
+            // A panic must still end the repair, or `r` stays locked out.
+            let (outcome, msg) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::repair::run(&job, &toc, &db, Some(&dest), &mut progress)
+            }))
+            .unwrap_or_else(|_| {
+                (
+                    crate::repair::Outcome::Failed,
+                    "Repair check failed: internal error".into(),
+                )
+            });
             let _ = tx.send(Event::Repair {
                 dir,
                 title,

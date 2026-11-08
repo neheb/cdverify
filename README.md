@@ -107,6 +107,7 @@ Not Found albums, corrupted tracks and failed lookups (AccurateRip or CTDB) are 
 - **Data-track discs without a CTDB entry.** The data track's length can't be inferred from audio files, so such an album shows up as Not Found or as ripping errors.
 - **Pregaps.** A pregap before track 1 (sometimes with hidden audio) shifts the whole TOC. It's recovered through CTDB when CTDB knows the disc. If the pregap audio was ripped into track 1, the tracks no longer line up and the album can't be verified.
 - **WavPack, APE, TAK, WMA.** Reported as "Cannot Check" because Symphonia can't decode them.
+- **Plain HTTP.** AccurateRip and CTDB are only served over HTTP, as with other rippers. A repair is accepted only if it matches CTDB's CRC32, but that CRC comes from the same unauthenticated response, so someone able to tamper with your traffic could feed you a consistent but wrong "repair". Repaired copies never replace the originals.
 
 ## License
 

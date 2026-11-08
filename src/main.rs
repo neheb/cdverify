@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, KeyEventKind};
 use ratatui::crossterm::execute;
@@ -90,6 +90,9 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if !cli.dir.is_dir() {
+        anyhow::bail!("{} is not a folder", cli.dir.display());
+    }
     let opts = Options {
         min_confidence: cli.min_confidence,
         use_tags: !cli.no_tag,
@@ -113,7 +116,8 @@ fn main() -> Result<()> {
     };
     let (tx, rx) = mpsc::channel();
     // Canonicalize so cache keys don't depend on how the path was typed.
-    let root = std::fs::canonicalize(&cli.dir).unwrap_or_else(|_| cli.dir.clone());
+    let root = std::fs::canonicalize(&cli.dir)
+        .with_context(|| format!("can't open {}", cli.dir.display()))?;
     let db = Arc::new(Db::new());
     // Headless mode has no `r` key, and the repairer's sender would keep the
     // channel open after the workers are gone.
@@ -138,7 +142,9 @@ fn main() -> Result<()> {
         let result = run_tui(&mut terminal, &mut app, rx);
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
         ratatui::restore();
-        app.save_cache();
+        if let Err(e) = app.save_cache() {
+            eprintln!("{e}");
+        }
         result
     }
 }
@@ -318,108 +324,127 @@ fn start(
             let root = root.clone();
             thread::spawn(move || {
                 loop {
-                    let Some((dir, files)) = queue.lock().unwrap().pop_front() else {
-                        break;
-                    };
-                    let stamps = cache::stamps(&files);
-                    let other_opts = Options {
-                        ctdb_first: !opts.ctdb_first,
-                        ..opts
-                    };
-                    let cached = |other: bool| {
-                        let (c, s) = prior.as_ref().zip(stamps.as_ref())?;
-                        let (albums, o) = match other {
-                            true => (c.get_other(&dir, s)?, &other_opts),
-                            false => (c.get(&dir, s)?, &opts),
-                        };
-                        // A repairable album gets its repaired copy written
-                        // when --repair is given.
-                        let unrepaired = ro.out.is_some()
-                            && albums
-                                .iter()
-                                .any(|a| a.repair_outcome == Some(repair::Outcome::Repairable));
-                        (verify::cached_valid(&albums, o) && !unrepaired).then_some(albums)
-                    };
-                    let hit = cached(false);
-                    let other_hit = both.then(|| cached(true)).flatten();
-                    // This mode's cached results are enough. The other mode is
-                    // only filled in for folders that get scanned anyway: one
-                    // missing from the cache needs rechecking (e.g. an album
-                    // AccurateRip doesn't know), which is for a run in that mode.
-                    if let Some(albums) = hit.clone() {
-                        let _ = tx.send(Event::Done {
-                            worker,
-                            dir,
-                            stamps,
-                            from_cache: true,
-                            albums,
-                            other: None,
-                        });
-                        continue;
-                    }
-                    let label = dir
-                        .strip_prefix(&root)
-                        .unwrap_or(&dir)
-                        .display()
-                        .to_string();
-                    let _ = tx.send(Event::Started {
-                        worker,
-                        label: label.clone(),
-                    });
+                    let next = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                    let Some((dir, files)) = next else { break };
                     // A panic (say, in a decoder) costs this folder only, and
                     // its Done still arrives so the run can finish.
-                    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let tracks = scan::probe_files(&files);
-                        let jobs = scan::group(&dir, tracks);
-                        let n = jobs.len() as f32;
-                        // A mode that is cached is reused album by album, if the
-                        // albums still line up with this folder's.
-                        let lined_up = |a: Option<Vec<verify::AlbumResult>>| {
-                            a.filter(|a| {
-                                a.len() == jobs.len()
-                                    && a.iter().zip(&jobs).all(|(r, j)| r.title == j.title)
-                            })
-                            .map(Vec::into_iter)
-                        };
-                        let (mut hit, mut other_hit) = (lined_up(hit), lined_up(other_hit));
-                        let (albums, other): (Vec<_>, Vec<_>) = jobs
-                            .iter()
-                            .enumerate()
-                            .map(|(i, job)| {
-                                let mut progress = |frac: f32| {
-                                    let _ = tx.send(Event::Progress {
-                                        worker,
-                                        frac: (i as f32 + frac) / n,
-                                    });
-                                };
-                                let prev = (
-                                    hit.as_mut().and_then(Iterator::next),
-                                    other_hit.as_mut().and_then(Iterator::next),
-                                );
-                                check_album(job, &root, &db, &opts, both, &ro, prev, &mut progress)
-                            })
-                            .unzip();
-                        (albums, other)
+                    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        check_folder(
+                            worker,
+                            &dir,
+                            &files,
+                            &root,
+                            &db,
+                            &opts,
+                            both,
+                            prior.as_deref(),
+                            &ro,
+                            &tx,
+                        )
                     }));
-                    let (albums, other, stamps) = match checked {
-                        Ok((albums, other)) => (albums, other, stamps),
-                        Err(panic) => {
-                            let album = verify::internal_error(&dir, label, &*panic);
-                            (vec![album], Vec::new(), None)
+                    let event = done.unwrap_or_else(|panic| {
+                        let label = dir
+                            .strip_prefix(&root)
+                            .unwrap_or(&dir)
+                            .display()
+                            .to_string();
+                        Event::Done {
+                            worker,
+                            albums: vec![verify::internal_error(&dir, label, &*panic)],
+                            dir,
+                            stamps: None,
+                            from_cache: false,
+                            other: both.then(Vec::new),
                         }
-                    };
-                    let _ = tx.send(Event::Done {
-                        worker,
-                        dir,
-                        stamps,
-                        from_cache: false,
-                        albums,
-                        other: both.then(|| other.into_iter().flatten().collect()),
                     });
+                    let _ = tx.send(event);
                 }
             });
         }
     });
+}
+
+/// Checks one folder, or takes its results from `prior`, and returns its
+/// `Done` event.
+#[allow(clippy::too_many_arguments)]
+fn check_folder(
+    worker: usize,
+    dir: &std::path::Path,
+    files: &[PathBuf],
+    root: &std::path::Path,
+    db: &Db,
+    opts: &Options,
+    both: bool,
+    prior: Option<&Cache>,
+    ro: &RepairOptions,
+    tx: &Sender<Event>,
+) -> Event {
+    let stamps = cache::stamps(files);
+    let other_opts = Options {
+        ctdb_first: !opts.ctdb_first,
+        ..*opts
+    };
+    let cached = |other: bool| {
+        let (c, s) = prior.zip(stamps.as_ref())?;
+        let (albums, o) = match other {
+            true => (c.get_other(dir, s)?, &other_opts),
+            false => (c.get(dir, s)?, opts),
+        };
+        // A repairable album gets its repaired copy written when --repair
+        // is given.
+        let unrepaired = ro.out.is_some()
+            && albums
+                .iter()
+                .any(|a| a.repair_outcome == Some(repair::Outcome::Repairable));
+        (verify::cached_valid(&albums, o) && !unrepaired).then_some(albums)
+    };
+    // This mode's cached results are enough. The other mode is only filled
+    // in for folders that get scanned anyway: one missing from the cache
+    // needs rechecking (e.g. an album AccurateRip doesn't know), which is
+    // for a run in that mode.
+    if let Some(albums) = cached(false) {
+        return Event::Done {
+            worker,
+            dir: dir.to_path_buf(),
+            stamps,
+            from_cache: true,
+            albums,
+            other: None,
+        };
+    }
+    let other_hit = both.then(|| cached(true)).flatten();
+    let label = dir.strip_prefix(root).unwrap_or(dir).display().to_string();
+    let _ = tx.send(Event::Started { worker, label });
+    let tracks = scan::probe_files(files);
+    let jobs = scan::group(dir, tracks);
+    let n = jobs.len() as f32;
+    // The other mode's cached results are reused album by album, if the
+    // albums still line up with this folder's.
+    let mut other_hit = other_hit
+        .filter(|a| a.len() == jobs.len() && a.iter().zip(&jobs).all(|(r, j)| r.title == j.title))
+        .map(Vec::into_iter);
+    let (albums, other): (Vec<_>, Vec<_>) = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, job)| {
+            let mut progress = |frac: f32| {
+                let _ = tx.send(Event::Progress {
+                    worker,
+                    frac: (i as f32 + frac) / n,
+                });
+            };
+            let prev = (None, other_hit.as_mut().and_then(Iterator::next));
+            check_album(job, root, db, opts, both, ro, prev, &mut progress)
+        })
+        .unzip();
+    Event::Done {
+        worker,
+        dir: dir.to_path_buf(),
+        stamps,
+        from_cache: false,
+        albums,
+        other: both.then(|| other.into_iter().flatten().collect()),
+    }
 }
 
 fn run_tui(
@@ -466,7 +491,9 @@ fn run_headless(app: &mut App, rx: Receiver<Event>) -> Result<()> {
     if !app.finished() {
         eprintln!("Workers stopped before every folder was checked");
     }
-    app.save_cache();
+    if let Err(e) = app.save_cache() {
+        eprintln!("{e}");
+    }
     let (json, txt) = report::write(&app.report_path, &app.albums)?;
     eprintln!(
         "{} of {} folders from cache ({})",

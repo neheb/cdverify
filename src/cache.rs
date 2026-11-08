@@ -115,10 +115,33 @@ impl Cache {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(self)?)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        // Per process, so that two runs don't write into one file; the
+        // last rename wins.
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let written = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(&serde_json::to_vec(self)?)
+            })
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Ok(written?)
+    }
+
+    /// Forgets folders under `root` that aren't in `seen` (deleted or moved
+    /// since), in both modes. Returns whether any were.
+    pub fn prune(&mut self, root: &Path, seen: &std::collections::HashSet<PathBuf>) -> bool {
+        let before = self.folders.len() + self.inverted.len();
+        for map in [&mut self.folders, &mut self.inverted] {
+            map.retain(|dir, _| !dir.starts_with(root) || seen.contains(dir));
+        }
+        self.folders.len() + self.inverted.len() != before
     }
 
     /// Cached results for `dir` if its files still match `files`.
@@ -250,6 +273,20 @@ mod tests {
             mtime_s: 1,
             mtime_ns: 2,
         }
+    }
+
+    #[test]
+    fn prunes_folders_gone_from_the_scanned_root() {
+        let mut c = Cache::default();
+        for dir in ["/music/a", "/music/b", "/other/c"] {
+            c.update(dir.into(), Some(vec![stamp(10)]), &[album(false)]);
+        }
+        let seen = [PathBuf::from("/music/a")].into_iter().collect();
+        assert!(c.prune(Path::new("/music"), &seen));
+        assert!(c.get(Path::new("/music/a"), &[stamp(10)]).is_some());
+        assert!(c.get(Path::new("/music/b"), &[stamp(10)]).is_none());
+        assert!(c.get(Path::new("/other/c"), &[stamp(10)]).is_some());
+        assert!(!c.prune(Path::new("/music"), &seen));
     }
 
     #[test]

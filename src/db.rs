@@ -82,7 +82,12 @@ impl Db {
     /// Returns `Ok(None)` when the disc is not in the database.
     pub fn lookup(&self, id: &DiscId) -> Result<Option<Pressings>> {
         let url = id.url();
-        if let Some(hit) = self.cache.lock().unwrap().get(&url) {
+        if let Some(hit) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&url)
+        {
             return Ok(hit.clone());
         }
         let result = match self.agent.get(&url).call() {
@@ -93,7 +98,10 @@ impl Db {
             Err(ureq::Error::StatusCode(404)) => None,
             Err(e) => return Err(e.into()),
         };
-        self.cache.lock().unwrap().insert(url, result.clone());
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(url, result.clone());
         Ok(result)
     }
 }
@@ -108,6 +116,9 @@ pub enum TocLayout {
     /// Audio only, but track 1 starts at `start` after a pregap that wasn't ripped.
     Pregap { start: u32 },
 }
+
+/// Sectors on the longest disc worth considering (well past 99 minutes).
+const MAX_SECTORS: u32 = 1 << 20;
 
 /// Largest parity stride (in frames) accepted from CTDB; CTDB uses 5880.
 pub const MAX_STRIDE: usize = 1 << 16;
@@ -139,7 +150,7 @@ fn ctdb_lookup(db: &Db, toc: &str, fuzzy: bool) -> Result<Vec<CtdbEntry>> {
         "http://db.cuetools.net/lookup2.php?version=3&ctdb=1&fuzzy={}&metadata=none&toc={toc}",
         fuzzy as u8
     );
-    if let Some(hit) = db.ctdb.lock().unwrap().get(&url) {
+    if let Some(hit) = db.ctdb.lock().unwrap_or_else(|e| e.into_inner()).get(&url) {
         return Ok(hit.clone());
     }
     let entries = match db.agent.get(&url).call() {
@@ -149,7 +160,10 @@ fn ctdb_lookup(db: &Db, toc: &str, fuzzy: bool) -> Result<Vec<CtdbEntry>> {
         Err(ureq::Error::StatusCode(404)) => Vec::new(),
         Err(e) => return Err(e.into()),
     };
-    db.ctdb.lock().unwrap().insert(url, entries.clone());
+    db.ctdb
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(url, entries.clone());
     Ok(entries)
 }
 
@@ -180,15 +194,28 @@ fn parse_ctdb_entries(xml: &str) -> Vec<CtdbEntry> {
                 .filter(|n| (1..=crate::parity::MAX_NPAR).contains(n)),
             syndrome: attr("syndrome").map(str::to_string),
             parity: attr("parity").map(str::to_string),
-            parity_url: attr("hasparity").filter(|p| !p.is_empty()).map(|p| {
-                match p.starts_with('/') {
-                    true => format!("http://db.cuetools.net{p}"),
-                    false => p.to_string(),
-                }
-            }),
+            parity_url: attr("hasparity").and_then(parity_url),
         });
     }
     out
+}
+
+/// Where to download an entry's `hasparity` from: a path on CTDB's server
+/// or a URL on a CUETools host. Anything else (the response is plain HTTP)
+/// is ignored rather than fetched.
+fn parity_url(p: &str) -> Option<String> {
+    if p.starts_with('/') && !p.starts_with("//") {
+        return Some(format!("http://db.cuetools.net{p}"));
+    }
+    let rest = p
+        .strip_prefix("http://")
+        .or_else(|| p.strip_prefix("https://"))?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    let ok = host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && (host == "cuetools.net" || host.ends_with(".cuetools.net"));
+    ok.then(|| p.to_string())
 }
 
 /// The CTDB TOC string for our audio tracks laid out as `layout`.
@@ -318,7 +345,11 @@ pub fn ctdb_repair_info(db: &Db, toc: &str) -> Result<Option<(u32, bool)>> {
 fn layout_from_toc(toc: &str, offsets: &[u32], audio_end: u32) -> Option<TocLayout> {
     let parts: Vec<&str> = toc.split(':').collect();
     let n = offsets.len();
-    let num = |s: &str| s.parse::<u32>().ok();
+    // Positions past any real disc are nonsense (and could overflow below).
+    let num = |s: &str| s.parse::<u32>().ok().filter(|&v| v <= MAX_SECTORS);
+    if audio_end > MAX_SECTORS {
+        return None;
+    }
     let audio_at = |parts: &[&str], base: u32| {
         parts
             .iter()
@@ -339,7 +370,8 @@ fn layout_from_toc(toc: &str, offsets: &[u32], audio_end: u32) -> Option<TocLayo
         // Audio tracks (starting at 0), data track, lead-out.
         let start = num(parts[n].strip_prefix('-')?)?;
         let leadout = num(parts[n + 1])?;
-        audio_at(&parts, 0).then_some(TocLayout::DataLast { start, leadout })
+        (audio_at(&parts, 0) && start >= audio_end && leadout > start)
+            .then_some(TocLayout::DataLast { start, leadout })
     } else if parts.len() == n + 1 {
         // Audio only: the same tracks shifted by a pregap before track 1.
         let start = num(parts[0])?;
@@ -452,6 +484,43 @@ mod tests {
                 .map(|e| (e.confidence, e.has_parity))
                 .collect::<Vec<_>>(),
             [(483, true), (1, false), (2, false)]
+        );
+    }
+
+    #[test]
+    fn parity_only_from_cuetools() {
+        assert_eq!(
+            parity_url("/parity/1").as_deref(),
+            Some("http://db.cuetools.net/parity/1")
+        );
+        assert!(parity_url("http://p.cuetools.net/11200").is_some());
+        assert!(parity_url("https://cuetools.net/x").is_some());
+        assert!(parity_url("http://evil.example/x").is_none());
+        assert!(parity_url("http://cuetools.net.evil.example/x").is_none());
+        assert!(parity_url("http://evilcuetools.net/x").is_none());
+        assert!(parity_url("http://x.cuetools.net@evil.example/").is_none());
+        assert!(parity_url("//evil.example/x").is_none());
+        assert!(parity_url("").is_none());
+    }
+
+    #[test]
+    fn rejects_impossible_layouts() {
+        let (offsets, end) = (&[0, 100][..], 200);
+        // Data track before the audio ends, lead-out before the data track,
+        // and positions past any disc.
+        assert_eq!(layout_from_toc("0:100:-150:300", offsets, end), None);
+        assert_eq!(layout_from_toc("0:100:-300:250", offsets, end), None);
+        assert_eq!(layout_from_toc("0:100:-300:4294967295", offsets, end), None);
+        assert_eq!(
+            layout_from_toc("-0:4294967200:4294967300:99", offsets, end),
+            None
+        );
+        assert_eq!(
+            layout_from_toc("0:100:-300:400", offsets, end),
+            Some(TocLayout::DataLast {
+                start: 300,
+                leadout: 400
+            })
         );
     }
 

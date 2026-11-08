@@ -745,7 +745,14 @@ pub fn verify_ctdb_first(
         (Some(Err(e)), _) => Err(e),
         _ => repair::analyze(job, &toc, db, progress),
     };
-    let Some((confidence, offset)) = analysis.as_ref().ok().and_then(|a| a.verified()) else {
+    // A track whose FLAC MD5 doesn't match is Corrupted, as in normal mode,
+    // even if its audio matches CTDB: AccurateRip's check reports it.
+    let Some((confidence, offset)) = analysis
+        .as_ref()
+        .ok()
+        .filter(|a| !a.md5_mismatch)
+        .and_then(|a| a.verified())
+    else {
         let (outcome, msg) = match &analysis {
             Ok(a) => repair::finish(job, a, dest),
             Err(e) => repair::failed(e),

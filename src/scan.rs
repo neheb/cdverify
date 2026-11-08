@@ -385,8 +385,17 @@ pub fn group(dir: &Path, tracks: Vec<TrackInfo>) -> Vec<AlbumJob> {
             > 1
     };
     let shared: Vec<bool> = groups.keys().map(|k| shared(&k.0, k.1)).collect();
-    let multi_disc = groups.keys().filter_map(|k| k.1).collect::<Vec<_>>().len() > 1
-        || groups.keys().any(|k| k.1.is_some_and(|d| d > 1));
+    // "(Disc n)" only for an album with several discs here, or a disc
+    // past the first; two unrelated albums tagged disc 1 don't need it.
+    let multi_disc: Vec<bool> = groups
+        .keys()
+        .map(|k| {
+            k.1.is_some_and(|d| d > 1)
+                || groups
+                    .keys()
+                    .any(|o| o.0 == k.0 && o.1.is_some() && o.1 != k.1)
+        })
+        .collect();
     let folder = dir
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -394,26 +403,29 @@ pub fn group(dir: &Path, tracks: Vec<TrackInfo>) -> Vec<AlbumJob> {
     groups
         .into_iter()
         .zip(shared)
-        .map(|(((album, disc, image), mut tracks), shared)| {
-            tracks.sort_by(|a, b| a.number.cmp(&b.number).then(a.path.cmp(&b.path)));
-            let artist = tracks.iter().find_map(|t| t.artist.clone());
-            let mut title = match (artist, album) {
-                (Some(ar), Some(al)) => format!("{ar} - {al}"),
-                (None, Some(al)) => al,
-                _ => folder.clone(),
-            };
-            if multi_disc && let Some(d) = disc {
-                title = format!("{title} (Disc {d})");
-            }
-            if shared && let Some(stem) = image.as_deref().and_then(Path::file_stem) {
-                title = format!("{title} [{}]", stem.to_string_lossy());
-            }
-            AlbumJob {
-                dir: dir.to_path_buf(),
-                title,
-                tracks,
-            }
-        })
+        .zip(multi_disc)
+        .map(
+            |((((album, disc, image), mut tracks), shared), multi_disc)| {
+                tracks.sort_by(|a, b| a.number.cmp(&b.number).then(a.path.cmp(&b.path)));
+                let artist = tracks.iter().find_map(|t| t.artist.clone());
+                let mut title = match (artist, album) {
+                    (Some(ar), Some(al)) => format!("{ar} - {al}"),
+                    (None, Some(al)) => al,
+                    _ => folder.clone(),
+                };
+                if multi_disc && let Some(d) = disc {
+                    title = format!("{title} (Disc {d})");
+                }
+                if shared && let Some(stem) = image.as_deref().and_then(Path::file_stem) {
+                    title = format!("{title} [{}]", stem.to_string_lossy());
+                }
+                AlbumJob {
+                    dir: dir.to_path_buf(),
+                    title,
+                    tracks,
+                }
+            },
+        )
         .collect()
 }
 
@@ -463,6 +475,30 @@ mod tests {
             ..info
         };
         assert!(split_image(&short, &sheet).is_none());
+    }
+
+    #[test]
+    fn disc_suffix_only_for_multi_disc_albums() {
+        let track = |album: &str, disc: u32| TrackInfo {
+            path: format!("{album}{disc}.flac").into(),
+            album: Some(album.into()),
+            disc: Some(disc),
+            number: Some(1),
+            total: Some(1),
+            ..Default::default()
+        };
+        let titles = |tracks| {
+            group(Path::new("/m"), tracks)
+                .into_iter()
+                .map(|j| j.title)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(titles(vec![track("A", 1), track("B", 1)]), ["A", "B"]);
+        assert_eq!(
+            titles(vec![track("A", 1), track("A", 2)]),
+            ["A (Disc 1)", "A (Disc 2)"]
+        );
+        assert_eq!(titles(vec![track("B", 2)]), ["B (Disc 2)"]);
     }
 
     #[test]

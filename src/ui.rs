@@ -236,7 +236,9 @@ fn draw_details(f: &mut Frame<'_>, a: &AlbumResult, scroll: usize, area: Rect) {
 }
 
 /// Word-wraps `text` to `width` columns; continuation lines are indented.
+/// A word longer than a line (say, a path) is split.
 fn wrap(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(8);
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split(' ').filter(|w| !w.is_empty()) {
@@ -248,6 +250,18 @@ fn wrap(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
             line.push(' ');
         }
         line.push_str(word);
+        while line.chars().count() > width {
+            let cut = line
+                .char_indices()
+                .nth(width)
+                .map_or(line.len(), |(i, _)| i);
+            let rest = format!("  {}", &line[cut..]);
+            line.truncate(cut);
+            lines.push(Line::from(Span::styled(
+                std::mem::replace(&mut line, rest),
+                style,
+            )));
+        }
     }
     if !line.trim().is_empty() {
         lines.push(Line::from(Span::styled(line, style)));
@@ -305,5 +319,9 @@ mod tests {
         );
         assert!(text(&lines).iter().all(|l| l.chars().count() <= 30));
         assert_eq!(text(&wrap("short", Style::new(), 30)), ["short"]);
+        assert_eq!(
+            text(&wrap("in /music/abcdefghijkl", Style::new(), 10)),
+            ["in", "  /music/a", "  bcdefghi", "  jkl"]
+        );
     }
 }

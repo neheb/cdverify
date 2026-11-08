@@ -2,8 +2,9 @@
 
 //! Writing repaired tracks: FLAC (keeping the original's metadata) or WAV.
 
-use std::io::Write;
-use std::path::Path;
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,26 +24,87 @@ pub fn write_track(original: &Path, out: &Path, pcm: &[i16]) -> Result<&'static 
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let tmp = out.with_extension(format!("{ext}.part"));
+    if ext != "flac" && ext != "wav" {
+        bail!("can only write repaired FLAC or WAV files");
+    }
+    // Work files sit next to the output, never in a shared temp folder.
+    let tmp = TempFile::new(out, &format!("{ext}.part"))?;
     let encoder = match ext.as_str() {
         "flac" => {
-            let (encoded, encoder) = encode_flac(pcm)?;
-            let original_bytes = std::fs::read(original)?;
-            std::fs::write(&tmp, transplant_metadata(&original_bytes, &encoded)?)?;
+            let (encoded, encoder) = encode_flac(pcm, out)?;
+            let header = read_flac_header(original)?;
+            let mut w = BufWriter::new(tmp.file()?);
+            write_with_metadata(&header, &encoded, &mut w)?;
+            w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
             encoder
         }
-        "wav" => {
-            std::fs::write(&tmp, wav_bytes(pcm))?;
+        _ => {
+            let mut w = BufWriter::new(tmp.file()?);
+            write_wav(pcm, &mut w)?;
+            w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
             "wav"
         }
-        _ => bail!("can only write repaired FLAC or WAV files"),
     };
-    if let Err(e) = check_decodes_to(&tmp, pcm) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    std::fs::rename(&tmp, out)?;
+    check_decodes_to(&tmp.path, pcm)?;
+    tmp.persist(out)?;
     Ok(encoder)
+}
+
+/// A work file created fresh (never through an existing file or link) and
+/// removed unless persisted.
+struct TempFile {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl TempFile {
+    /// `<out>.<pid>-<n>.<suffix>`, created exclusively.
+    fn new(out: &Path, suffix: &str) -> Result<TempFile> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = out.file_name().context("bad output file name")?;
+        for _ in 0..100 {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let mut file_name = name.to_os_string();
+            file_name.push(format!(".{}-{n}.{suffix}", std::process::id()));
+            let path = out.with_file_name(file_name);
+            match File::options().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(TempFile {
+                        path,
+                        file: Some(file),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+            }
+        }
+        bail!("couldn't create a work file next to {}", out.display())
+    }
+
+    /// The open file (only once).
+    fn file(&self) -> Result<File> {
+        match &self.file {
+            Some(f) => Ok(f.try_clone()?),
+            None => bail!("work file already closed"),
+        }
+    }
+
+    fn persist(mut self, to: &Path) -> Result<()> {
+        self.file = None;
+        std::fs::rename(&self.path, to)?;
+        self.path = PathBuf::new();
+        Ok(())
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        self.file = None;
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn check_decodes_to(path: &Path, pcm: &[i16]) -> Result<()> {
@@ -63,21 +125,20 @@ fn check_decodes_to(path: &Path, pcm: &[i16]) -> Result<()> {
 }
 
 /// Encodes with the reference `flac` binary when available, else flacenc.
-fn encode_flac(pcm: &[i16]) -> Result<(Vec<u8>, &'static str)> {
-    match encode_with_flac_binary(pcm) {
+/// `out` is where the result goes; flac's work file is put next to it.
+fn encode_flac(pcm: &[i16], out: &Path) -> Result<(Vec<u8>, &'static str)> {
+    match encode_with_flac_binary(pcm, out) {
         Ok(bytes) => Ok((bytes, "flac")),
         Err(_) => Ok((encode_with_flacenc(pcm)?, "flacenc")),
     }
 }
 
-fn encode_with_flac_binary(pcm: &[i16]) -> Result<Vec<u8>> {
+fn encode_with_flac_binary(pcm: &[i16], out: &Path) -> Result<Vec<u8>> {
     // Encode to a file, not stdout: flac can only fill in STREAMINFO's
-    // sample count and MD5 (and write a seek table) when it can seek.
-    let tmp = std::env::temp_dir().join(format!(
-        "cdverify-{}-{:?}.flac",
-        std::process::id(),
-        std::thread::current().id()
-    ));
+    // sample count and MD5 (and write a seek table) when it can seek. The
+    // file is created exclusively first; --force lets flac reuse it.
+    let mut tmp = TempFile::new(out, "enc.flac")?;
+    tmp.file = None;
     let mut child = Command::new("flac")
         .args([
             "--silent",
@@ -92,31 +153,72 @@ fn encode_with_flac_binary(pcm: &[i16]) -> Result<Vec<u8>> {
             "--sample-rate=44100",
             "-o",
         ])
-        .arg(&tmp)
+        .arg(&tmp.path)
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
-    let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-    let writer = std::thread::spawn(move || stdin.write_all(&bytes));
-    let status = child.wait()?;
-    writer.join().map_err(|_| anyhow!("writer panicked"))??;
-    let result = match status.success() {
-        true => std::fs::read(&tmp).map_err(Into::into),
-        false => Err(anyhow!("flac exited with {status}")),
-    };
-    let _ = std::fs::remove_file(&tmp);
-    result
+    let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+    // Fed in chunks, not as one byte copy of the whole (maybe CD-sized) image.
+    let written = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || -> std::io::Result<()> {
+            let mut stdin = BufWriter::new(stdin);
+            for chunk in pcm.chunks(1 << 16) {
+                let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
+                stdin.write_all(&bytes)?;
+            }
+            stdin.flush()
+        });
+        let status = child.wait();
+        (status, writer.join())
+    });
+    let status = written.0?;
+    written.1.map_err(|_| anyhow!("writer panicked"))??;
+    if !status.success() {
+        bail!("flac exited with {status}");
+    }
+    Ok(std::fs::read(&tmp.path)?)
+}
+
+/// Interleaved 16-bit stereo as a flacenc source, converted a block at a
+/// time instead of copied whole.
+struct PcmSource<'a> {
+    pcm: &'a [i16],
+    pos: usize,
+}
+
+impl flacenc::source::Source for PcmSource<'_> {
+    fn channels(&self) -> usize {
+        2
+    }
+    fn bits_per_sample(&self) -> usize {
+        16
+    }
+    fn sample_rate(&self) -> usize {
+        44100
+    }
+    fn read_samples<F: flacenc::source::Fill>(
+        &mut self,
+        block_size: usize,
+        dest: &mut F,
+    ) -> Result<usize, flacenc::error::SourceError> {
+        let end = (self.pos + block_size * 2).min(self.pcm.len());
+        let block: Vec<i32> = self.pcm[self.pos..end].iter().map(|&s| s as i32).collect();
+        dest.fill_interleaved(&block)?;
+        self.pos = end;
+        Ok(block.len() / 2)
+    }
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.pcm.len() / 2)
+    }
 }
 
 fn encode_with_flacenc(pcm: &[i16]) -> Result<Vec<u8>> {
     use flacenc::component::BitRepr;
     use flacenc::error::Verify;
 
-    let samples: Vec<i32> = pcm.iter().map(|&s| s as i32).collect();
-    let source = flacenc::source::MemSource::from_samples(&samples, 2, 16, 44100);
+    let source = PcmSource { pcm, pos: 0 };
     let config = flacenc::config::Encoder::default()
         .into_verified()
         .map_err(|e| anyhow!("flacenc config: {e:?}"))?;
@@ -135,7 +237,7 @@ fn encode_with_flacenc(pcm: &[i16]) -> Result<Vec<u8>> {
     stream
         .write(&mut sink)
         .map_err(|e| anyhow!("flacenc write: {e:?}"))?;
-    Ok(sink.as_slice().to_vec())
+    Ok(sink.into_inner())
 }
 
 struct Block<'a> {
@@ -167,9 +269,32 @@ fn parse_flac(bytes: &[u8]) -> Result<(Vec<Block<'_>>, &[u8])> {
     Ok((blocks, &bytes[p..]))
 }
 
-/// The new encoding's STREAMINFO, seek table and frames, with every other
-/// metadata block (tags, pictures, padding, …) copied from the original.
-fn transplant_metadata(original: &[u8], encoded: &[u8]) -> Result<Vec<u8>> {
+/// The `fLaC` marker and metadata blocks of a FLAC file, without reading
+/// its audio.
+fn read_flac_header(path: &Path) -> Result<Vec<u8>> {
+    let mut f = std::io::BufReader::new(File::open(path)?);
+    let mut out = vec![0u8; 4];
+    f.read_exact(&mut out)?;
+    loop {
+        let mut header = [0u8; 4];
+        f.read_exact(&mut header)
+            .context("truncated FLAC metadata")?;
+        let len = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+        out.extend(header);
+        let start = out.len();
+        out.resize(start + len, 0);
+        f.read_exact(&mut out[start..])
+            .context("truncated FLAC metadata block")?;
+        if header[0] & 0x80 != 0 {
+            return Ok(out);
+        }
+    }
+}
+
+/// Writes the new encoding's STREAMINFO, seek table and frames, with every
+/// other metadata block (tags, pictures, padding, …) copied from the
+/// original's header.
+fn write_with_metadata(original: &[u8], encoded: &[u8], out: &mut impl Write) -> Result<()> {
     let (old_blocks, _) = parse_flac(original)?;
     let (new_blocks, frames) = parse_flac(encoded)?;
     let mut blocks: Vec<&Block<'_>> = Vec::new();
@@ -183,34 +308,39 @@ fn transplant_metadata(original: &[u8], encoded: &[u8]) -> Result<Vec<u8>> {
     if blocks.first().map(|b| b.kind) != Some(STREAMINFO) {
         bail!("encoder produced no STREAMINFO");
     }
-    let mut out = b"fLaC".to_vec();
+    out.write_all(b"fLaC")?;
     for (i, b) in blocks.iter().enumerate() {
         let last = if i + 1 == blocks.len() { 0x80 } else { 0 };
         let len = (b.data.len() as u32).to_be_bytes();
-        out.extend([last | b.kind, len[1], len[2], len[3]]);
-        out.extend(b.data);
+        out.write_all(&[last | b.kind, len[1], len[2], len[3]])?;
+        out.write_all(b.data)?;
     }
-    out.extend(frames);
-    Ok(out)
+    out.write_all(frames)?;
+    Ok(())
 }
 
-fn wav_bytes(pcm: &[i16]) -> Vec<u8> {
-    let data_len = (pcm.len() * 2) as u32;
-    let mut out = Vec::with_capacity(44 + data_len as usize);
-    out.extend(b"RIFF");
-    out.extend((36 + data_len).to_le_bytes());
-    out.extend(b"WAVEfmt ");
-    out.extend(16u32.to_le_bytes());
-    out.extend(1u16.to_le_bytes()); // PCM
-    out.extend(2u16.to_le_bytes());
-    out.extend(44100u32.to_le_bytes());
-    out.extend((44100u32 * 4).to_le_bytes());
-    out.extend(4u16.to_le_bytes());
-    out.extend(16u16.to_le_bytes());
-    out.extend(b"data");
-    out.extend(data_len.to_le_bytes());
-    out.extend(pcm.iter().flat_map(|s| s.to_le_bytes()));
-    out
+fn write_wav(pcm: &[i16], out: &mut impl Write) -> Result<()> {
+    let data_len = u32::try_from(pcm.len() * 2)
+        .ok()
+        .filter(|l| *l <= u32::MAX - 36)
+        .context("too long for a WAV file")?;
+    out.write_all(b"RIFF")?;
+    out.write_all(&(36 + data_len).to_le_bytes())?;
+    out.write_all(b"WAVEfmt ")?;
+    out.write_all(&16u32.to_le_bytes())?;
+    out.write_all(&1u16.to_le_bytes())?; // PCM
+    out.write_all(&2u16.to_le_bytes())?;
+    out.write_all(&44100u32.to_le_bytes())?;
+    out.write_all(&(44100u32 * 4).to_le_bytes())?;
+    out.write_all(&4u16.to_le_bytes())?;
+    out.write_all(&16u16.to_le_bytes())?;
+    out.write_all(b"data")?;
+    out.write_all(&data_len.to_le_bytes())?;
+    for chunk in pcm.chunks(1 << 16) {
+        let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
+        out.write_all(&bytes)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -245,7 +375,8 @@ mod tests {
             &[(STREAMINFO, b"new-info"), (SEEKTABLE, b"new-seek")],
             b"new-frames",
         );
-        let out = transplant_metadata(&original, &encoded).unwrap();
+        let mut out = Vec::new();
+        write_with_metadata(&original, &encoded, &mut out).unwrap();
         let (blocks, frames) = parse_flac(&out).unwrap();
         let got: Vec<(u8, &[u8])> = blocks.iter().map(|b| (b.kind, b.data)).collect();
         assert_eq!(
@@ -273,7 +404,7 @@ mod tests {
             ("flacenc.flac", encode_with_flacenc(&pcm).unwrap()),
             (
                 "binary.flac",
-                encode_with_flac_binary(&pcm).unwrap_or_default(),
+                encode_with_flac_binary(&pcm, &dir.join("binary.flac")).unwrap_or_default(),
             ),
         ] {
             if bytes.is_empty() {

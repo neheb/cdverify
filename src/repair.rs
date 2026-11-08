@@ -72,6 +72,8 @@ impl Outcome {
 
 pub struct Analysis {
     pub statuses: Vec<EntryStatus>,
+    /// Some track's FLAC MD5 didn't match its audio.
+    pub md5_mismatch: bool,
     /// The most confident repair, if any.
     plan: Option<(u32, i64, Vec<Fix>)>,
     bounds: Arc<[u64]>,
@@ -258,7 +260,9 @@ impl Pass {
             bail!("track {}: {note}", k + 1);
         }
         self.mark();
-        self.check(db)
+        let mut analysis = self.check(db)?;
+        analysis.md5_mismatch = notes.iter().any(Option::is_some);
+        Ok(analysis)
     }
 
     fn check(self, db: &Db) -> Result<Analysis> {
@@ -369,6 +373,7 @@ impl Pass {
         }
         Ok(Analysis {
             statuses,
+            md5_mismatch: false,
             plan,
             bounds,
         })
@@ -468,11 +473,11 @@ pub fn destination(out: &Path, root: &Path, dir: &Path) -> PathBuf {
     out.join(dir.strip_prefix(root).unwrap_or(dir))
 }
 
-/// Default folder for repaired copies.
-pub fn default_out() -> PathBuf {
+/// Default folder for repaired copies, if there's a home folder to put it in.
+pub fn default_out() -> Option<PathBuf> {
     std::env::home_dir()
-        .unwrap_or_default()
-        .join("accuraterip-repaired")
+        .filter(|h| h.is_absolute())
+        .map(|h| h.join("accuraterip-repaired"))
 }
 
 /// Writes corrected copies of the files holding the affected tracks (a
@@ -521,13 +526,25 @@ pub fn write_repaired(
         let (start, end) = (bounds[first], bounds[last]);
         // An image's pregap precedes the album's first frame.
         let skip = track.image_start.unwrap_or(0);
-        let mut pcm: Vec<i16> = Vec::with_capacity(((skip + end - start) * 2) as usize);
+        // The whole file: an image can be a CD's worth (~850 MB).
+        let expected = usize::try_from((skip + end - start) * 2)
+            .context("file too large to repair in memory")?;
+        let mut pcm: Vec<i16> = Vec::new();
+        pcm.try_reserve_exact(expected)
+            .context("not enough memory to repair this file")?;
         decode::decode(&track.path, false, |frames| {
             for &f in frames {
                 pcm.push(f as u16 as i16);
                 pcm.push((f >> 16) as u16 as i16);
             }
         })?;
+        // A file that changed since it was checked mustn't be "repaired".
+        if pcm.len() != expected {
+            bail!(
+                "{} decoded to a different length than when it was checked",
+                track.path.display()
+            );
+        }
         let first_word = (start * 2) as usize;
         for f in fixes
             .iter()

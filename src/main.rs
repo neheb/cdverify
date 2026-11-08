@@ -88,7 +88,7 @@ struct Cli {
     cache: Option<PathBuf>,
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
     if !cli.dir.is_dir() {
         anyhow::bail!("{} is not a folder", cli.dir.display());
@@ -125,15 +125,25 @@ fn main() -> Result<()> {
         tx: tx.clone(),
         db: db.clone(),
         root: root.clone(),
-        out: cli.repair.clone().unwrap_or_else(repair::default_out),
+        out: cli.repair.clone().or_else(repair::default_out),
     });
     // Work out both modes' results (normal and --invert) so a later run in
     // either mode comes from the cache; without CTDB there's only one.
     let both = !cli.no_ctdb;
-    start(root, threads, opts, both, prior, repair_opts, db, tx);
+    start(
+        root.clone(),
+        threads,
+        opts,
+        both,
+        prior,
+        repair_opts,
+        db,
+        tx,
+    );
 
     let mut app = App::new(cli.report.clone(), cli.skip_non_cd, cache, cache_path);
     app.repairer = repairer;
+    app.root = Some(root);
     if cli.headless {
         run_headless(&mut app, rx)
     } else {
@@ -145,7 +155,7 @@ fn main() -> Result<()> {
         if let Err(e) = app.save_cache() {
             eprintln!("{e}");
         }
-        result
+        result.map(|()| std::process::ExitCode::SUCCESS)
     }
 }
 
@@ -184,13 +194,17 @@ fn without_repair(album: &verify::AlbumResult) -> verify::AlbumResult {
 }
 
 /// Checks albums with ripping errors against CTDB's parity data (every
-/// album with `check_all`), writing repaired copies when `--repair` is given.
+/// album with `check_all`), writing repaired copies when `--repair` is given
+/// and `write` is set (this run is in normal mode: only the run's own mode
+/// writes, so the two modes never write different repairs to one place).
+#[allow(clippy::too_many_arguments)]
 fn maybe_repair(
     album: &mut verify::AlbumResult,
     job: &scan::AlbumJob,
     root: &std::path::Path,
     db: &Db,
     ro: &RepairOptions,
+    write: bool,
     known: Option<(repair::Outcome, String)>,
     progress: &mut dyn FnMut(f32),
 ) {
@@ -205,6 +219,7 @@ fn maybe_repair(
         let dest = ro
             .out
             .as_ref()
+            .filter(|_| write)
             .map(|o| repair::destination(o, root, &job.dir));
         let (outcome, msg) =
             known.unwrap_or_else(|| repair::run(job, &toc, db, dest.as_deref(), progress));
@@ -248,7 +263,7 @@ fn check_album(
             }
             false => verify::verify(job, db, opts, progress),
         };
-        maybe_repair(&mut album, job, root, db, ro, None, progress);
+        maybe_repair(&mut album, job, root, db, ro, true, None, progress);
         return (album, None);
     }
     let (normal, inverted) = match opts.ctdb_first {
@@ -268,7 +283,8 @@ fn check_album(
         }
         (None, Some(inverted)) => {
             let mut normal = verify::verify(job, db, opts, progress);
-            maybe_repair(&mut normal, job, root, db, ro, None, progress);
+            let write = !opts.ctdb_first;
+            maybe_repair(&mut normal, job, root, db, ro, write, None, progress);
             (normal, inverted)
         }
         (None, None) => check_both(job, root, db, opts, dest.as_deref(), ro, progress),
@@ -292,15 +308,21 @@ fn check_both(
     // CTDB's parity pass shares AccurateRip's first decode.
     let mut prep = verify::CtdbPrep::new(job, db);
     let mut normal = verify::verify_with(job, db, opts, prep.as_mut(), &mut |f| progress(f / 2.0));
-    // In normal mode, write a repaired copy only if maybe_repair would.
-    let dest = dest.filter(|_| opts.ctdb_first || wants_repair(&normal, ro));
+    // Only this run's mode writes repaired copies: the two modes' CTDB
+    // checks can be for different TOCs, and so different repairs.
+    let dest = dest.filter(|_| opts.ctdb_first);
     let (inverted, checked) =
         verify::verify_ctdb_first(job, db, opts, dest, Some(&normal), prep, &mut |f| {
             progress(0.5 + f / 2.0)
         });
     // Normal mode's CTDB check is the same one if it's for the same TOC.
-    let known = checked.filter(|_| inverted.ctdb_toc == normal.ctdb_toc);
-    maybe_repair(&mut normal, job, root, db, ro, known, progress);
+    // In normal mode with --repair, a repairable album is checked again to
+    // write its copy (a rare second decode).
+    let write = !opts.ctdb_first;
+    let known = checked
+        .filter(|_| inverted.ctdb_toc == normal.ctdb_toc)
+        .filter(|(o, _)| !(write && ro.out.is_some() && *o == repair::Outcome::Repairable));
+    maybe_repair(&mut normal, job, root, db, ro, write, known, progress);
     (normal, inverted)
 }
 
@@ -474,7 +496,9 @@ fn run_tui(
     }
 }
 
-fn run_headless(app: &mut App, rx: Receiver<Event>) -> Result<()> {
+/// Fails (exit status 1) if the workers stopped before every folder was
+/// checked.
+fn run_headless(app: &mut App, rx: Receiver<Event>) -> Result<std::process::ExitCode> {
     while !app.finished() {
         let Ok(ev) = rx.recv() else { break };
         if let Event::Done { albums, .. } = &ev {
@@ -504,5 +528,8 @@ fn run_headless(app: &mut App, rx: Receiver<Event>) -> Result<()> {
         app.cache_path.display()
     );
     eprintln!("Report written to {} and {}", json.display(), txt.display());
-    Ok(())
+    Ok(match app.finished() {
+        true => std::process::ExitCode::SUCCESS,
+        false => std::process::ExitCode::FAILURE,
+    })
 }

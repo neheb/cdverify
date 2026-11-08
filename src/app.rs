@@ -59,7 +59,8 @@ pub struct Repairer {
     pub tx: std::sync::mpsc::Sender<Event>,
     pub db: std::sync::Arc<crate::db::Db>,
     pub root: PathBuf,
-    pub out: PathBuf,
+    /// `None` without `--repair` and a home folder for the default.
+    pub out: Option<PathBuf>,
 }
 
 pub struct App {
@@ -82,6 +83,10 @@ pub struct App {
     pub hit: HitAreas,
     pub repairer: Option<Repairer>,
     repairing: bool,
+    /// The scanned library, and its folders seen so far: once all are in,
+    /// cache entries for folders no longer there are dropped.
+    pub root: Option<PathBuf>,
+    seen: std::collections::HashSet<PathBuf>,
 }
 
 impl App {
@@ -104,6 +109,8 @@ impl App {
             hit: HitAreas::default(),
             repairer: None,
             repairing: false,
+            root: None,
+            seen: Default::default(),
         }
     }
 
@@ -167,6 +174,7 @@ impl App {
             } => {
                 self.active.remove(&worker);
                 self.done += 1;
+                self.seen.insert(dir.clone());
                 if from_cache {
                     self.cached += 1;
                 } else {
@@ -177,6 +185,11 @@ impl App {
                     self.cache_dirty = true;
                 }
                 if self.finished() {
+                    if let Some(root) = &self.root
+                        && self.cache.prune(root, &self.seen)
+                    {
+                        self.cache_dirty = true;
+                    }
                     let _ = self.save_cache();
                 }
                 for a in albums {
@@ -214,7 +227,9 @@ impl App {
             .iter()
             .position(|&v| v == album.verdict)
             .unwrap();
-        let key = |a: &AlbumResult| (a.dir.clone(), a.title.clone());
+        fn key(a: &AlbumResult) -> (&PathBuf, &String) {
+            (&a.dir, &a.title)
+        }
         let pos = self.albums.partition_point(|a| key(a) < key(&album));
         let rank = self.albums[..pos]
             .iter()
@@ -234,6 +249,7 @@ impl App {
         let len = self.bucket(Verdict::ALL[self.tab]).len();
         match key.code {
             KeyCode::Char('q') => return true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             // Esc is often pressed to dismiss a terminal text selection, so it
             // only clears the status message.
             KeyCode::Esc => self.message = None,
@@ -330,7 +346,11 @@ impl App {
         let (dir, title) = (album.dir.clone(), album.title.clone());
         let paths: Vec<PathBuf> = album.tracks.iter().map(|t| t.path.clone()).collect();
         let (tx, db) = (r.tx.clone(), r.db.clone());
-        let dest = crate::repair::destination(&r.out, &r.root, &dir);
+        let Some(out) = &r.out else {
+            self.message = Some("No home folder for repaired copies; pass --repair DIR".into());
+            return;
+        };
+        let dest = crate::repair::destination(out, &r.root, &dir);
         self.repairing = true;
         self.message = Some(format!("Checking {title} against CTDB…"));
         std::thread::spawn(move || {
@@ -465,9 +485,12 @@ fn apply_repair(a: &mut AlbumResult, outcome: crate::repair::Outcome, msg: Strin
         _ if a.verdict == Verdict::RipErrors => a.reason = format!("{}; {note}", a.reason),
         _ => {}
     }
-    // As in the scan: a failed check is worth retrying next run.
-    if outcome == crate::repair::Outcome::Failed {
-        a.recheck = true;
+    // As in the scan: an exact CTDB match is final, a failed check is worth
+    // retrying next run.
+    match outcome {
+        crate::repair::Outcome::Verified => a.recheck = false,
+        crate::repair::Outcome::Failed => a.recheck = true,
+        _ => {}
     }
     a.repair_outcome = Some(outcome);
     a.repair = Some(msg);

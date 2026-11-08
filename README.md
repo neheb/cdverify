@@ -47,7 +47,7 @@ cargo run --release -- ~/Music
 
 Keys: `←/→`, `Tab` or `1`–`5` switch list · `↑/↓` select · `PgUp/PgDn` page through
 albums · `c` copy the album's MusicBrainz URL · `r` repair · `e` export report ·
-`q` quit. `Esc` only clears the status message.
+`q` or Ctrl+C quit. `Esc` only clears the status message.
 
 Copying uses the Windows clipboard on Windows and `wl-copy` on Wayland,
 otherwise the terminal's clipboard via OSC 52.
@@ -64,12 +64,12 @@ Options:
 - `--skip-non-cd`: hide lossy and non-44.1 kHz/16-bit albums.
 - `--threads N`: number of worker threads (default: number of CPUs).
 - `--report PATH`: report path (JSON plus a `.txt` summary).
-- `--headless`: no TUI. Prints one line per album and writes the report at the end.
+- `--headless`: no TUI. Prints one line per album and writes the report at the end. Exits with status 1 if the run stopped before every folder was checked.
 - `--no-ctdb`: don't contact the CUETools database (no layout lookups or repair-data checks).
 - `--invert`: use CTDB as the primary source. Albums whose audio matches a CTDB entry exactly are accurate; only the rest are checked against AccurateRip, and those that match neither land in Ripping Errors (with CTDB's repair verdict). Albums CTDB doesn't know (or can't be reached for) get AccurateRip's verdict.
 - `--repair DIR`: write repaired copies of every repairable album under `DIR` during the scan, mirroring the library's folders (see Repair below). The library itself is never modified.
 - `--rescan`: re-verify every folder and ignore cached results (the cache is still updated).
-- `--cache PATH`: results cache location (default `~/.cache/cdverify/cache.json`, or `%LOCALAPPDATA%\cdverify\cache.json` on Windows). Each run caches results for both normal and `--invert` mode (unless `--no-ctdb` is given), so switching modes doesn't re-verify. The AccurateRip and CTDB checks are shared between the two, costing at most one extra decode per album.
+- `--cache PATH`: results cache location (default `~/.cache/cdverify/cache.json`, or `%LOCALAPPDATA%\cdverify\cache.json` on Windows). Each run caches results for both normal and `--invert` mode (unless `--no-ctdb` is given), so switching modes doesn't re-verify. The AccurateRip and CTDB checks are shared between the two, costing at most one extra decode per album, but every run asks CTDB about each album and computes its parity, and downloads CTDB's repair data (up to a few MB) for albums that differ from a CTDB entry. Use `--no-ctdb` to skip all of that. Entries for folders that are gone from the scanned library are dropped at the end of a complete run.
 
 ## How it works
 

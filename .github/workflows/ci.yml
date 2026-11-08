@@ -1,5 +1,5 @@
-# Checks formatting and lints, and runs the tests on Linux and Windows, for
-# every push to main and every pull request.
+# Checks formatting and lints, and runs the tests on Linux, Windows and ARMv7
+# (QEMU), for every push to main and every pull request.
 name: CI
 
 on:
@@ -24,6 +24,29 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
+
+  # The ARMv7 release's NEON parity code (cfg(neon), see build.rs) builds
+  # only for that target: lint it and run the tests under QEMU.
+  armv7-neon:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -C target-feature=+neon
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: rust-lld
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUNNER: qemu-arm-static
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          targets: armv7-unknown-linux-musleabihf
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - run: cargo clippy --locked --all-targets --target armv7-unknown-linux-musleabihf -- -D warnings
+      - run: cargo test --locked --target armv7-unknown-linux-musleabihf
 
   test:
     strategy:

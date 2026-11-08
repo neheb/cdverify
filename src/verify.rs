@@ -631,6 +631,8 @@ pub fn verify_with(
 }
 
 const CTDB_LOOKUP_FAILED: &str = "CTDB lookup failed";
+const UNKNOWN_LENGTH: &str = "Unknown track length";
+const NOT_IN_CTDB: &str = "; not in CTDB";
 
 /// Whether a [`verify`] result may change on a later run of unchanged files:
 /// albums missing from the database (or below the confidence threshold) may
@@ -672,9 +674,10 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
 }
 
 /// Whether an ineligible album's `reason` blames a file that couldn't be
-/// opened, or a format parameter that couldn't be read (shown as 0).
+/// opened, or a format parameter or length that couldn't be read (shown as 0).
 fn probe_incomplete(reason: &str) -> bool {
     reason.starts_with(crate::scan::CANNOT_DECODE)
+        || reason == UNKNOWN_LENGTH
         || reason
             .strip_prefix(NOT_CD_QUALITY)
             .is_some_and(|r| r.contains("(0 Hz") || r.contains(" 0 bit") || r.contains(" 0 ch"))
@@ -724,8 +727,8 @@ pub fn verify_ctdb_first(
         // CTDB can't say: AccurateRip has the final word.
         Ok(None) => {
             let mut ar = accuraterip(job, db, opts, ar, progress);
-            if !ar.reason.contains("CTDB") {
-                ar.reason.push_str("; not in CTDB");
+            if !ar.reason.ends_with(NOT_IN_CTDB) {
+                ar.reason.push_str(NOT_IN_CTDB);
             }
             return (ar, None);
         }
@@ -1011,7 +1014,7 @@ fn check_eligible(job: &AlbumJob) -> Result<(), String> {
             ));
         }
         match t.frames {
-            None => return Err("Unknown track length".into()),
+            None => return Err(UNKNOWN_LENGTH.into()),
             Some(f) if f % SECTOR_FRAMES != 0 => {
                 return Err("Track length is not whole CD sectors".into());
             }

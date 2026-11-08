@@ -27,7 +27,7 @@ pub enum Kind {
 pub fn audio_kind(path: &Path) -> Option<Kind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
-        "flac" | "wav" | "aif" | "aiff" | "aifc" | "m4a" => Kind::Lossless,
+        "flac" | "wav" | "aif" | "aiff" | "aifc" | "m4a" | "mp4" => Kind::Lossless,
         "mp3" | "mp2" | "ogg" | "oga" | "opus" | "mpc" | "spx" | "aac" | "webm" => Kind::Lossy,
         "wv" | "ape" | "tak" | "tta" | "wma" | "dsf" | "dff" | "mka" | "shn" => Kind::Unsupported,
         _ => return None,

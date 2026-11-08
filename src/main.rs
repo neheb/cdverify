@@ -178,6 +178,8 @@ fn without_repair(album: &verify::AlbumResult) -> verify::AlbumResult {
         }
     }
     album.repair = None;
+    // Whatever is built on it is checked against CTDB this run.
+    album.cached = false;
     album
 }
 

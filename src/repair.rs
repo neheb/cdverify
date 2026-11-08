@@ -280,11 +280,13 @@ impl Pass {
         // CRC32 of our rip over CTDB's window at `offset`, after `fixes`.
         let window_crc = |offset: i64, fixes: &[Fix]| -> Option<u32> {
             let (a, b) = parity::crc_window(geo, offset);
-            let mut c = prefix(b)? ^ crc32_shift(prefix(a)?, (b - a) * 4);
+            // An album shorter than the window has nothing to check.
+            let len = b.checked_sub(a)?;
+            let mut c = prefix(b)? ^ crc32_shift(prefix(a)?, len * 4);
             for f in fixes {
                 let end = (f.word as u64 + 1) * 2;
                 let raw = crc32_raw(0, &f.diff.to_le_bytes());
-                c ^= crc32_shift(raw, b * 4 - end);
+                c ^= crc32_shift(raw, (b * 4).checked_sub(end)?);
             }
             Some(c)
         };
@@ -331,7 +333,9 @@ impl Pass {
                 statuses.push(not("parity file too short"));
                 continue;
             };
-            if full[..npar] != head[..] {
+            // An old entry's parity may give fewer syndrome words than the
+            // file; the ones it gives must agree.
+            if head.len() > npar || full[..head.len()] != head[..] {
                 statuses.push(not("parity file doesn't match its entry"));
                 continue;
             }
@@ -381,7 +385,7 @@ fn entry_npar(e: &CtdbEntry) -> usize {
 fn entry_syndrome(e: &CtdbEntry) -> Option<Vec<u16>> {
     match (&e.syndrome, &e.parity) {
         (Some(s), _) => parity::bytes_to_syndrome(1, entry_npar(e), &db::base64_decode(s)?),
-        (None, Some(p)) => parity::parity_bytes_to_syndrome(8, &db::base64_decode(p)?),
+        (None, Some(p)) => parity::parity_bytes_to_syndrome(entry_npar(e), &db::base64_decode(p)?),
         _ => None,
     }
 }

@@ -67,6 +67,7 @@ Options:
 - `--headless`: no TUI. Prints one line per album and writes the report at the end.
 - `--no-ctdb`: don't contact the CUETools database (no layout lookups or repair-data checks).
 - `--invert`: use CTDB as the primary source. Albums whose audio matches a CTDB entry exactly are accurate; only the rest are checked against AccurateRip, and those that match neither land in Ripping Errors (with CTDB's repair verdict). Albums CTDB doesn't know (or can't be reached for) get AccurateRip's verdict.
+- `--repair DIR`: write repaired copies of every repairable album under `DIR` during the scan, mirroring the library's folders (see Repair below). The library itself is never modified.
 - `--rescan`: re-verify every folder and ignore cached results (the cache is still updated).
 - `--cache PATH`: results cache location (default `~/.cache/cdverify/cache.json`, or `%LOCALAPPDATA%\cdverify\cache.json` on Windows). Each run caches results for both normal and `--invert` mode (unless `--no-ctdb` is given), so switching modes doesn't re-verify. The AccurateRip and CTDB checks are shared between the two, costing at most one extra decode per album.
 
@@ -84,11 +85,11 @@ Options:
   3. Accepts the fix only if the corrected audio's CRC32 matches CTDB's.
   4. Writes corrected copies of just the damaged tracks to `DIR` (default `~/accuraterip-repaired`), mirroring the library's folders. FLAC tags and pictures are kept.
 
-  Repaired copies can be written for FLAC and WAV files only; AIFF and ALAC albums can be checked against CTDB, but not repaired.
+  Repaired copies can be written for FLAC and WAV files only; AIFF and ALAC albums can be checked against CTDB, but not repaired. A repaired WAV file holds the audio only: chunks such as `LIST`/`INFO` or BWF metadata aren't carried over.
 
   Your library is never modified. It encodes with `flac` if installed, otherwise with the built-in encoder. Each written file is decoded again and compared before it's kept. Repair can fix damaged samples (up to about a second of damage in total), but not a *sample slip*, where the drive lost sync and added or dropped samples. Those show up as accurate tracks on either side matching at different offsets; the tool points out the track to re-rip.
 - **Pressing offsets.** If some tracks don't match, the tool computes the frame-450 checksum at every offset within ±range. Offsets where it matches the database get the full checksums recomputed at that offset. This finds rips of a different pressing of the same CD.
-- **Formats.** Decoding uses [Symphonia](https://github.com/pdeljanov/Symphonia): FLAC, WAV, AIFF, and ALAC in `.m4a`.
+- **Formats.** Decoding uses [Symphonia](https://github.com/pdeljanov/Symphonia): FLAC, WAV, AIFF, and ALAC in `.m4a`/`.mp4`.
 
 ## Results cache
 

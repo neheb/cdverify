@@ -29,3 +29,10 @@ codegen-units = 1
 
 [target."cfg(windows)".dependencies]
 clipboard-win = "5.4.1"
+
+[lints.clippy]
+# Tests may unwrap (see clippy.toml); elsewhere, handle the case or use
+# #[expect(clippy::unwrap_used, reason = "...")] to say why it can't happen.
+unwrap_used = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"

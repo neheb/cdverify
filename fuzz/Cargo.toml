@@ -1,0 +1,55 @@
+[package]
+name = "cdverify-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Keep in step with the main Cargo.toml: src/lib.rs compiles its parsers.
+[dependencies]
+anyhow = "1.0.104"
+libfuzzer-sys = "0.4.10"
+serde = { version = "1.0.229", features = ["derive"] }
+sha1 = "0.11.0"
+ureq = { version = "3.4.2", default-features = false, features = ["gzip"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(neon)"] }
+
+# Not part of any workspace above.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "accuraterip"
+path = "fuzz_targets/accuraterip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ctdb_xml"
+path = "fuzz_targets/ctdb_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cue"
+path = "fuzz_targets/cue.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parity"
+path = "fuzz_targets/parity.rs"
+test = false
+doc = false
+bench = false

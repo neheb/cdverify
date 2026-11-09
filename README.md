@@ -110,6 +110,21 @@ Not Found albums, corrupted tracks and failed lookups (AccurateRip or CTDB) are 
 - **WavPack, APE, TAK, WMA.** Reported as "Cannot Check" because Symphonia can't decode them.
 - **Plain HTTP.** AccurateRip and CTDB are only served over HTTP, as with other rippers. A repair is accepted only if it matches CTDB's CRC32, but that CRC comes from the same unauthenticated response, so someone able to tamper with your traffic could feed you a consistent but wrong "repair". Repaired copies never replace the originals.
 
+## Development
+
+CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test`, [`cargo deny check`](https://github.com/EmbarkStudios/cargo-deny)
+(advisories and licenses, see `deny.toml`) and a short fuzzing run.
+
+The fuzz targets in `fuzz/` cover the parsers of untrusted input (AccurateRip
+responses, CTDB XML, CUE sheets) and the parity decoder that repairs rips.
+With [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) and a nightly
+toolchain:
+
+```
+cargo +nightly fuzz run parity
+```
+
 ## License
 
 Copyright (C) 2026 Rosen Penev

@@ -197,7 +197,10 @@ fn without_repair(album: &verify::AlbumResult) -> verify::AlbumResult {
 /// album with `check_all`), writing repaired copies when `--repair` is given
 /// and `write` is set (this run is in normal mode: only the run's own mode
 /// writes, so the two modes never write different repairs to one place).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "worker plumbing, called from one place"
+)]
 fn maybe_repair(
     album: &mut verify::AlbumResult,
     job: &scan::AlbumJob,
@@ -226,12 +229,8 @@ fn maybe_repair(
         if album.verdict == verify::Verdict::RipErrors {
             album.reason = format!("{}; {}", album.reason, outcome.verdict_note());
         }
-        // An exact CTDB match is a final answer (until --rescan), like an
-        // accurate rip; a failed check is worth retrying next run.
-        match outcome {
-            repair::Outcome::Verified => album.recheck = false,
-            repair::Outcome::Failed => album.recheck = true,
-            _ => {}
+        if let Some(recheck) = outcome.recheck() {
+            album.recheck = recheck;
         }
         album.repair_outcome = Some(outcome);
         album.repair = Some(msg);
@@ -241,7 +240,10 @@ fn maybe_repair(
 /// Checks one album in this run's mode and, with `both`, in the other mode
 /// too, sharing the AccurateRip and CTDB checks between them. `prev` holds
 /// cached results for (this mode, the other mode), which are reused.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "worker plumbing, called from one place"
+)]
 fn check_album(
     job: &scan::AlbumJob,
     root: &std::path::Path,
@@ -326,7 +328,10 @@ fn check_both(
     (normal, inverted)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "worker plumbing, called from one place"
+)]
 fn start(
     root: PathBuf,
     threads: usize,
@@ -390,7 +395,10 @@ fn start(
 
 /// Checks one folder, or takes its results from `prior`, and returns its
 /// `Done` event.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "worker plumbing, called from one place"
+)]
 fn check_folder(
     worker: usize,
     dir: &std::path::Path,

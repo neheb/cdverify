@@ -364,16 +364,17 @@ pub fn group(dir: &Path, tracks: Vec<TrackInfo>) -> Vec<AlbumJob> {
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
     };
-    if groups.len() == 2 && groups.contains_key(&(None, None, None)) {
-        let untagged = &groups[&(None, None, None)];
-        let (_, tagged) = groups
-            .iter()
-            .find(|(k, _)| **k != (None, None, None))
-            .unwrap();
-        let exts: Vec<_> = tagged.iter().map(ext).collect();
-        if untagged.iter().all(|t| exts.contains(&ext(t))) {
-            let untagged = groups.remove(&(None, None, None)).unwrap();
-            groups.values_mut().next().unwrap().extend(untagged);
+    if groups.len() == 2
+        && let Some(untagged) = groups.remove(&(None, None, None))
+    {
+        if let Some(tagged) = groups.values_mut().next()
+            && untagged
+                .iter()
+                .all(|t| tagged.iter().any(|u| ext(u) == ext(t)))
+        {
+            tagged.extend(untagged);
+        } else {
+            groups.insert((None, None, None), untagged);
         }
     }
     // Images that would otherwise share a title are told apart by file name.

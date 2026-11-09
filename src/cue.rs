@@ -45,7 +45,7 @@ pub fn from_flac(path: &Path) -> Option<Vec<CueTrack>> {
 }
 
 /// Parses a CUESHEET metadata block.
-fn parse_flac_block(data: &[u8]) -> Option<Vec<CueTrack>> {
+pub fn parse_flac_block(data: &[u8]) -> Option<Vec<CueTrack>> {
     // Catalog number (128), lead-in (8), CD flag and reserved (259).
     let mut p = 128 + 8 + 259;
     let ntracks = *data.get(p)?;

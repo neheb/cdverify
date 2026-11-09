@@ -1,0 +1,51 @@
+# cargo-deny: security advisories, licenses compatible with the GPL-3.0
+# binaries the releases ship, and crate sources. Run with `cargo deny check`.
+
+[graph]
+# Lint the Windows-only dependencies (clipboard-win) too.
+targets = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "armv7-unknown-linux-musleabihf",
+  "arm-unknown-linux-musleabihf",
+  "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+# All GPL-3.0-compatible.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "GPL-3.0-or-later",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Unlicense",
+  "WTFPL",
+  "Zlib",
+]
+
+[bans]
+# Duplicates come from upstream (flacenc's digest 0.10, ratatui's two syns)
+# and cost size, not safety.
+multiple-versions = "allow"
+wildcards = "deny"
+# ureq is built without TLS; keep it that way.
+deny = [{ name = "openssl-sys" }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

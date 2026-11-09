@@ -5,7 +5,7 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /
+    directories: [/, /fuzz]
     schedule:
       interval: monthly
     # Wait a week after a release before proposing it.

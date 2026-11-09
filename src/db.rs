@@ -40,14 +40,13 @@ pub fn parse(bytes: &[u8], ntracks: usize) -> Result<Vec<Pressing>> {
         if bytes.len() - p < n * 9 {
             bail!("truncated AccurateRip entries");
         }
-        let entries = (0..n)
-            .map(|i| {
-                let e = &bytes[p + i * 9..p + i * 9 + 9];
-                Entry {
-                    confidence: e[0],
-                    crc: u32::from_le_bytes(e[1..5].try_into().unwrap()),
-                    crc450: u32::from_le_bytes(e[5..9].try_into().unwrap()),
-                }
+        let (records, _) = bytes[p..p + n * 9].as_chunks::<9>();
+        let entries = records
+            .iter()
+            .map(|&[confidence, c0, c1, c2, c3, d0, d1, d2, d3]| Entry {
+                confidence,
+                crc: u32::from_le_bytes([c0, c1, c2, c3]),
+                crc450: u32::from_le_bytes([d0, d1, d2, d3]),
             })
             .collect();
         p += n * 9;
@@ -170,7 +169,7 @@ fn ctdb_lookup(db: &Db, toc: &str, fuzzy: bool) -> Result<Vec<CtdbEntry>> {
 /// Pulls the attributes of each `<entry …>` tag out of a CTDB response. Not a
 /// real XML parser: it relies on CTDB's fixed output (double-quoted attributes,
 /// no `>` inside values), and a tag it can't read is skipped.
-fn parse_ctdb_entries(xml: &str) -> Vec<CtdbEntry> {
+pub fn parse_ctdb_entries(xml: &str) -> Vec<CtdbEntry> {
     let mut out = Vec::new();
     for entry in xml.split("<entry").skip(1) {
         let entry = entry.split('>').next().unwrap_or_default();
@@ -203,7 +202,7 @@ fn parse_ctdb_entries(xml: &str) -> Vec<CtdbEntry> {
 /// Where to download an entry's `hasparity` from: a path on CTDB's server
 /// or a URL on a CUETools host. Anything else (the response is plain HTTP)
 /// is ignored rather than fetched.
-fn parity_url(p: &str) -> Option<String> {
+pub fn parity_url(p: &str) -> Option<String> {
     if p.starts_with('/') && !p.starts_with("//") {
         return Some(format!("http://db.cuetools.net{p}"));
     }
@@ -342,7 +341,7 @@ pub fn ctdb_repair_info(db: &Db, toc: &str) -> Result<Option<(u32, bool)>> {
 
 /// Matches a CTDB TOC (`start:start:…:leadout`, data tracks prefixed with
 /// `-`) against our audio tracks.
-fn layout_from_toc(toc: &str, offsets: &[u32], audio_end: u32) -> Option<TocLayout> {
+pub fn layout_from_toc(toc: &str, offsets: &[u32], audio_end: u32) -> Option<TocLayout> {
     let parts: Vec<&str> = toc.split(':').collect();
     let n = offsets.len();
     // Positions past any real disc are nonsense (and could overflow below).

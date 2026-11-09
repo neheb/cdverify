@@ -521,7 +521,7 @@ mod neon {
     /// core for the table lookup, which on Cortex-A9 stalls until the NEON
     /// pipeline drains, so four columns share each drain. LLVM doesn't
     /// schedule it this way: this is twice as fast.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "NEON intrinsics; see the SAFETY comment")]
     fn feed_quads(quads: &mut [[u16; 4 * MAX_NPAR]], words: &[u16], table: &super::EncodeTable) {
         let stride = words.len() / BLOCK_STRIDES;
         for (c, quad) in quads.iter_mut().enumerate() {

@@ -48,6 +48,17 @@ impl Verdict {
         Verdict::CannotCheck,
     ];
 
+    /// Position in [`Verdict::ALL`].
+    pub const fn index(self) -> usize {
+        match self {
+            Verdict::Corrupted => 0,
+            Verdict::RipErrors => 1,
+            Verdict::Accurate => 2,
+            Verdict::NotFound => 3,
+            Verdict::CannotCheck => 4,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Verdict::Corrupted => "Tracks Corrupted",
@@ -246,6 +257,10 @@ fn identify(job: &AlbumJob, result: &mut AlbumResult) -> (Vec<u32>, DiscId) {
 }
 
 /// Track lengths in sectors of an eligible album.
+#[expect(
+    clippy::unwrap_used,
+    reason = "check_eligible rejects albums with a track of unknown length"
+)]
 fn track_sectors(job: &AlbumJob) -> Vec<u32> {
     job.tracks
         .iter()
@@ -359,7 +374,7 @@ pub fn verify_with(
     let mut early: Vec<OffsetAccum> = Vec::new();
     let mut buffer: Option<Vec<u32>> = pressings.as_ref().map(|_| Vec::new());
     let mut ready = 0;
-    let total = *bounds.last().unwrap() as f32;
+    let total = bounds.last().copied().unwrap_or(0) as f32;
     let notes = decode::decode_album(&job.tracks, true, |pos, frames| {
         acc0.push(pos, frames);
         windows.push(pos, frames);
@@ -1008,8 +1023,8 @@ pub const NOT_CD_QUALITY: &str = "Not CD quality";
 
 /// Checks that an album can be verified at all (lossless CD audio, complete).
 fn check_eligible(job: &AlbumJob) -> Result<(), String> {
-    if let Some(t) = job.tracks.iter().find(|t| t.problem.is_some()) {
-        return Err(t.problem.clone().unwrap());
+    if let Some(problem) = job.tracks.iter().find_map(|t| t.problem.clone()) {
+        return Err(problem);
     }
     for t in &job.tracks {
         if t.sample_rate != Some(44100) || t.bits != Some(16) || t.channels != Some(2) {

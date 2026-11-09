@@ -68,6 +68,17 @@ impl Outcome {
             Outcome::Failed => "CTDB check failed",
         }
     }
+
+    /// Whether the album should be checked again next run, if this outcome
+    /// decides it: an exact CTDB match is final (until --rescan), like an
+    /// accurate rip, and a failed check is worth retrying.
+    pub fn recheck(self) -> Option<bool> {
+        match self {
+            Outcome::Verified => Some(false),
+            Outcome::Failed => Some(true),
+            Outcome::Repairable | Outcome::Repaired | Outcome::NotRepairable => None,
+        }
+    }
 }
 
 pub struct Analysis {
@@ -198,7 +209,7 @@ impl Pass {
     /// Looks up CTDB's entries for `toc`, ready to be fed the album.
     pub fn new(job: &AlbumJob, toc: &str, db: &Db) -> Result<Pass> {
         let bounds = track_bounds(job)?;
-        let samples = *bounds.last().unwrap();
+        let samples = bounds.last().copied().unwrap_or(0);
         let entries = db::ctdb_exact(db, toc).context("CTDB lookup")?;
         let stride_frames = entries.iter().find_map(|e| e.stride).unwrap_or(5880);
         let geo = Geometry::new(samples, stride_frames * 2);
@@ -397,6 +408,7 @@ fn entry_syndrome(e: &CtdbEntry) -> Option<Vec<u16>> {
 
 fn track_bounds(job: &AlbumJob) -> Result<Arc<[u64]>> {
     let mut b = vec![0u64];
+    let mut end = 0;
     for t in &job.tracks {
         let frames = t
             .frames
@@ -404,7 +416,8 @@ fn track_bounds(job: &AlbumJob) -> Result<Arc<[u64]>> {
         if frames % SECTOR_FRAMES != 0 {
             bail!("not whole CD sectors: {}", t.path.display());
         }
-        b.push(b.last().unwrap() + frames);
+        end += frames;
+        b.push(end);
     }
     Ok(b.into())
 }

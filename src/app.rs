@@ -223,10 +223,7 @@ impl App {
 
     /// Inserts keeping each bucket sorted, and keeps the selection on the same album.
     fn insert(&mut self, album: AlbumResult) {
-        let tab = Verdict::ALL
-            .iter()
-            .position(|&v| v == album.verdict)
-            .unwrap();
+        let tab = album.verdict.index();
         fn key(a: &AlbumResult) -> (&PathBuf, &String) {
             (&a.dir, &a.title)
         }
@@ -485,12 +482,8 @@ fn apply_repair(a: &mut AlbumResult, outcome: crate::repair::Outcome, msg: Strin
         _ if a.verdict == Verdict::RipErrors => a.reason = format!("{}; {note}", a.reason),
         _ => {}
     }
-    // As in the scan: an exact CTDB match is final, a failed check is worth
-    // retrying next run.
-    match outcome {
-        crate::repair::Outcome::Verified => a.recheck = false,
-        crate::repair::Outcome::Failed => a.recheck = true,
-        _ => {}
+    if let Some(recheck) = outcome.recheck() {
+        a.recheck = recheck;
     }
     a.repair_outcome = Some(outcome);
     a.repair = Some(msg);

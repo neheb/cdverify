@@ -74,7 +74,7 @@ fn parse_flac_block(data: &[u8]) -> Option<Vec<CueTrack>> {
         }
         tracks.push(CueTrack {
             number: number as u32,
-            start: offset + index1.or(first)?,
+            start: offset.checked_add(index1.or(first)?)?,
         });
     }
     (!tracks.is_empty()).then_some(tracks)
@@ -220,5 +220,18 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn rejects_overflowing_flac_offsets() {
+        let mut b = vec![0u8; 128 + 8 + 259];
+        b.push(1);
+        b.extend(u64::MAX.to_be_bytes());
+        b.push(1);
+        b.extend([0u8; 12 + 14]);
+        b.push(1);
+        b.extend(588u64.to_be_bytes());
+        b.extend([1, 0, 0, 0]);
+        assert_eq!(parse_flac_block(&b), None);
     }
 }

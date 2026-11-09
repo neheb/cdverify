@@ -34,7 +34,7 @@ jobs:
     env:
       RUSTFLAGS: -C target-feature=+neon
       CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: rust-lld
-      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUNNER: qemu-arm-static
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUNNER: qemu-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,7 +44,7 @@ jobs:
           toolchain: stable
           targets: armv7-unknown-linux-musleabihf
           components: clippy
-      - run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user
       - run: cargo clippy --locked --all-targets --target armv7-unknown-linux-musleabihf -- -D warnings
       - run: cargo test --locked --target armv7-unknown-linux-musleabihf
 
@@ -96,8 +96,10 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz build
+      # The prebuilt cargo-fuzz is a musl binary and would default to
+      # building for musl, which has no sanitizer support.
+      - run: cargo fuzz build --target x86_64-unknown-linux-gnu
       - run: |
           for t in $(cargo fuzz list); do
-            cargo fuzz run "$t" -- -max_total_time=60
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=60
           done

@@ -351,30 +351,31 @@ impl App {
         self.repairing = true;
         self.message = Some(format!("Checking {title} against CTDB…"));
         std::thread::spawn(move || {
-            let mut files = paths.clone();
-            files.extend(crate::scan::cue_files_beside(&paths));
-            let tracks = crate::scan::probe_files(&files);
-            let job = crate::scan::AlbumJob {
-                dir: dir.clone(),
-                title: title.clone(),
-                tracks,
-            };
-            let mut last = 0;
-            let mut progress = |f: f32| {
-                let pct = (f * 100.0) as u32;
-                if pct >= last + 2 {
-                    last = pct;
-                    let msg = format!("Checking {title} against CTDB: {pct}%");
-                    let _ = tx.send(Event::Repair {
-                        dir: dir.clone(),
-                        title: title.clone(),
-                        msg,
-                        outcome: None,
-                    });
-                }
-            };
-            // A panic must still end the repair, or `r` stays locked out.
+            // A panic (in probing, decoding, …) must still end the repair,
+            // or `r` stays locked out.
             let (outcome, msg) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut files = paths.clone();
+                files.extend(crate::scan::cue_files_beside(&paths));
+                let tracks = crate::scan::probe_files(&files);
+                let job = crate::scan::AlbumJob {
+                    dir: dir.clone(),
+                    title: title.clone(),
+                    tracks,
+                };
+                let mut last = 0;
+                let mut progress = |f: f32| {
+                    let pct = (f * 100.0) as u32;
+                    if pct >= last + 2 {
+                        last = pct;
+                        let msg = format!("Checking {title} against CTDB: {pct}%");
+                        let _ = tx.send(Event::Repair {
+                            dir: dir.clone(),
+                            title: title.clone(),
+                            msg,
+                            outcome: None,
+                        });
+                    }
+                };
                 crate::repair::run(&job, &toc, &db, Some(&dest), &mut progress)
             }))
             .unwrap_or_else(|_| {

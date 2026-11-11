@@ -238,8 +238,8 @@ fn maybe_repair(
 }
 
 /// Checks one album in this run's mode and, with `both`, in the other mode
-/// too, sharing the AccurateRip and CTDB checks between them. `prev` holds
-/// cached results for (this mode, the other mode), which are reused.
+/// too, sharing the AccurateRip and CTDB checks between them. `other` is a
+/// cached result for the other mode, which is reused.
 #[expect(
     clippy::too_many_arguments,
     reason = "worker plumbing, called from one place"
@@ -251,7 +251,7 @@ fn check_album(
     opts: &Options,
     both: bool,
     ro: &RepairOptions,
-    prev: (Option<verify::AlbumResult>, Option<verify::AlbumResult>),
+    other: Option<verify::AlbumResult>,
     progress: &mut dyn FnMut(f32),
 ) -> (verify::AlbumResult, Option<verify::AlbumResult>) {
     let dest = ro
@@ -268,28 +268,29 @@ fn check_album(
         maybe_repair(&mut album, job, root, db, ro, true, None, progress);
         return (album, None);
     }
-    let (normal, inverted) = match opts.ctdb_first {
-        true => (prev.1, prev.0),
-        false => (prev.0, prev.1),
-    };
-    let (normal, inverted) = match (normal, inverted) {
-        (Some(n), Some(i)) => (n, i),
-        (Some(normal), None) => {
-            // Only --invert itself writes repaired copies of a CTDB mismatch;
-            // in normal mode, maybe_repair already decided for this album.
-            let dest = dest.as_deref().filter(|_| opts.ctdb_first);
+    // With the other mode cached, only this run's mode is checked, and
+    // (being this run's) it may write repaired copies.
+    let (normal, inverted) = match (other, opts.ctdb_first) {
+        (Some(normal), true) => {
             let ar = without_repair(&normal);
-            let inverted =
-                verify::verify_ctdb_first(job, db, opts, dest, Some(&ar), None, progress).0;
+            let inverted = verify::verify_ctdb_first(
+                job,
+                db,
+                opts,
+                dest.as_deref(),
+                Some(&ar),
+                None,
+                progress,
+            )
+            .0;
             (normal, inverted)
         }
-        (None, Some(inverted)) => {
+        (Some(inverted), false) => {
             let mut normal = verify::verify(job, db, opts, progress);
-            let write = !opts.ctdb_first;
-            maybe_repair(&mut normal, job, root, db, ro, write, None, progress);
+            maybe_repair(&mut normal, job, root, db, ro, true, None, progress);
             (normal, inverted)
         }
-        (None, None) => check_both(job, root, db, opts, dest.as_deref(), ro, progress),
+        (None, _) => check_both(job, root, db, opts, dest.as_deref(), ro, progress),
     };
     match opts.ctdb_first {
         true => (inverted, Some(normal)),
@@ -465,8 +466,8 @@ fn check_folder(
                     frac: (i as f32 + frac) / n,
                 });
             };
-            let prev = (None, other_hit.as_mut().and_then(Iterator::next));
-            check_album(job, root, db, opts, both, ro, prev, &mut progress)
+            let other = other_hit.as_mut().and_then(Iterator::next);
+            check_album(job, root, db, opts, both, ro, other, &mut progress)
         })
         .unzip();
     Event::Done {

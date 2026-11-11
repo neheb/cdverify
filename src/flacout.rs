@@ -16,9 +16,25 @@ const STREAMINFO: u8 = 0;
 const PADDING: u8 = 1;
 const SEEKTABLE: u8 = 3;
 
-/// Writes `pcm` (interleaved 16-bit stereo, 44.1 kHz) to `out` in the format
-/// of `original`, verifies it decodes back to `pcm`, and returns the encoder.
-pub fn write_track(original: &Path, out: &Path, pcm: &[i16]) -> Result<&'static str> {
+/// A repaired track written and verified next to its destination, not yet
+/// in place. Dropping it removes the work file.
+pub struct Staged {
+    tmp: TempFile,
+    out: PathBuf,
+}
+
+impl Staged {
+    /// Moves the file to its destination, and returns that path.
+    pub fn commit(self) -> Result<PathBuf> {
+        self.tmp.persist(&self.out)?;
+        Ok(self.out)
+    }
+}
+
+/// Writes `pcm` (interleaved 16-bit stereo, 44.1 kHz) for `out` in the format
+/// of `original` and verifies it decodes back to `pcm`. Returns the staged
+/// file, to be committed to `out`, and the encoder.
+pub fn stage_track(original: &Path, out: &Path, pcm: &[i16]) -> Result<(Staged, &'static str)> {
     let ext = original
         .extension()
         .and_then(|e| e.to_str())
@@ -46,8 +62,8 @@ pub fn write_track(original: &Path, out: &Path, pcm: &[i16]) -> Result<&'static 
         }
     };
     check_decodes_to(&tmp.path, pcm)?;
-    tmp.persist(out)?;
-    Ok(encoder)
+    let out = out.to_path_buf();
+    Ok((Staged { tmp, out }, encoder))
 }
 
 /// A work file created fresh (never through an existing file or link) and
@@ -281,10 +297,12 @@ fn read_flac_header(path: &Path) -> Result<Vec<u8>> {
             .context("truncated FLAC metadata")?;
         let len = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
         out.extend(header);
-        let start = out.len();
-        out.resize(start + len, 0);
-        f.read_exact(&mut out[start..])
-            .context("truncated FLAC metadata block")?;
+        // Grows with what's actually there, rather than trusting `len` up
+        // front: a truncated file mustn't cost a 16 MiB allocation.
+        let got = (&mut f).take(len as u64).read_to_end(&mut out)?;
+        if got != len {
+            bail!("truncated FLAC metadata block");
+        }
         if header[0] & 0x80 != 0 {
             return Ok(out);
         }

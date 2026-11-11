@@ -14,10 +14,27 @@ pub fn write(path: &Path, albums: &[AlbumResult]) -> Result<(PathBuf, PathBuf)> 
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(albums)?)?;
     let txt = path.with_extension("txt");
-    std::fs::write(&txt, text(albums))?;
+    // Both are written in full before either replaces an older report.
+    let json_tmp = tmp_path(path);
+    let txt_tmp = tmp_path(&txt);
+    let written = std::fs::write(&json_tmp, serde_json::to_string_pretty(albums)?)
+        .and_then(|()| std::fs::write(&txt_tmp, text(albums)))
+        .and_then(|()| std::fs::rename(&json_tmp, path))
+        .and_then(|()| std::fs::rename(&txt_tmp, &txt));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&json_tmp);
+        let _ = std::fs::remove_file(&txt_tmp);
+    }
+    written?;
     Ok((path.to_path_buf(), txt))
+}
+
+/// `<path>.<pid>.tmp`, next to `path`.
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    path.with_file_name(name)
 }
 
 pub fn text(albums: &[AlbumResult]) -> String {

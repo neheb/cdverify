@@ -103,12 +103,12 @@ pub fn parse_text(text: &str) -> Option<Vec<CueTrack>> {
             Some("INDEX") => {
                 if words.next().and_then(|i| i.parse::<u32>().ok()) == Some(1)
                     && let Some((number, true)) = current
-                    && let Some(start) = words.next().and_then(msf)
+                    && let Some(start) = words
+                        .next()
+                        .and_then(msf)
+                        .and_then(|s| s.checked_mul(SECTOR_FRAMES))
                 {
-                    tracks.push(CueTrack {
-                        number,
-                        start: start * SECTOR_FRAMES,
-                    });
+                    tracks.push(CueTrack { number, start });
                 }
             }
             _ => {}
@@ -145,12 +145,24 @@ pub fn read_text(path: &Path) -> Option<String> {
 fn msf(s: &str) -> Option<u64> {
     let mut parts = s.split(':').map(|p| p.parse::<u64>().ok());
     let (m, sec, f) = (parts.next()??, parts.next()??, parts.next()??);
-    Some((m * 60 + sec) * 75 + f)
+    m.checked_mul(60)?
+        .checked_add(sec)?
+        .checked_mul(75)?
+        .checked_add(f)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_sheet_overflow_drops_track() {
+        let text = "FILE \"a.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  \
+                    TRACK 02 AUDIO\n    INDEX 01 999999999999999999:00:00\n";
+        let tracks = parse_text(text).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(msf("18446744073709551615:00:00"), None);
+    }
 
     #[test]
     fn parses_text_sheet() {

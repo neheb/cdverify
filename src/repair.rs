@@ -211,7 +211,7 @@ impl Pass {
         let bounds = track_bounds(job)?;
         let samples = bounds.last().copied().unwrap_or(0);
         let entries = db::ctdb_exact(db, toc).context("CTDB lookup")?;
-        let stride_frames = entries.iter().find_map(|e| e.stride).unwrap_or(5880);
+        let stride_frames = entries.iter().find_map(|e| e.stride).unwrap_or(OLD_STRIDE);
         let geo = Geometry::new(samples, stride_frames * 2);
         let reach = stride_frames as u64;
         let (a0, b0) = parity::crc_window(geo, 0);
@@ -314,7 +314,7 @@ impl Pass {
                 confidence: conf,
                 reason: reason.into(),
             };
-            if e.stride != Some(stride_frames) {
+            if entry_stride(e) != stride_frames {
                 statuses.push(not("different parity stride"));
                 continue;
             }
@@ -389,6 +389,15 @@ impl Pass {
             bounds,
         })
     }
+}
+
+/// Parity stride (in frames) of old CTDB entries, which don't give one.
+const OLD_STRIDE: usize = 5880;
+
+/// The entry's parity stride in frames. Entries without `stride` are old
+/// ones, which always used [`OLD_STRIDE`].
+fn entry_stride(e: &CtdbEntry) -> usize {
+    e.stride.unwrap_or(OLD_STRIDE)
 }
 
 /// The entry's parity words per column. Entries without `npar` are old
@@ -532,7 +541,9 @@ pub fn write_repaired(
             files.push((first, last + 1));
         }
     }
-    let mut written = Vec::new();
+    // Every file is written and checked before any is put in place, so a
+    // failure part-way leaves no partial set behind.
+    let mut staged = Vec::new();
     let mut encoder = "";
     for (n, &(first, last)) in files.iter().enumerate() {
         let track = &job.tracks[first];
@@ -572,10 +583,15 @@ pub fn write_repaired(
             .file_name()
             .ok_or_else(|| anyhow!("bad file name"))?;
         let out = out_dir.join(name);
-        encoder = flacout::write_track(&track.path, &out, &pcm)?;
-        written.push(out);
+        let (file, enc) = flacout::stage_track(&track.path, &out, &pcm)?;
+        encoder = enc;
+        staged.push(file);
         progress((n + 1) as f32 / files.len() as f32);
     }
+    let written = staged
+        .into_iter()
+        .map(flacout::Staged::commit)
+        .collect::<Result<Vec<_>>>()?;
     Ok((written, encoder))
 }
 

@@ -1061,8 +1061,21 @@ fn check_eligible(job: &AlbumJob) -> Result<(), String> {
     if n > 99 {
         return Err("More than 99 tracks".into());
     }
+    // Which also keeps the u32 sector arithmetic on TOCs from overflowing.
+    let sectors = job
+        .tracks
+        .iter()
+        .filter_map(|t| t.frames)
+        .chain(job.tracks.first().and_then(|t| t.image_start))
+        .fold(0u64, |a, f| a.saturating_add(f / SECTOR_FRAMES));
+    if sectors > MAX_CD_SECTORS {
+        return Err("Longer than a CD can hold".into());
+    }
     Ok(())
 }
+
+/// The most a CD's TOC can address: 100 minutes at 75 sectors a second.
+const MAX_CD_SECTORS: u64 = 100 * 60 * 75;
 
 /// Parses dBpoweramp's `ACCURATERIPRESULT`, e.g.
 /// `AccurateRip: Accurate (confidence 12)   [ABCD1234]`, returning the confidence.

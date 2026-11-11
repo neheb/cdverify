@@ -25,6 +25,8 @@ members = ["."]
 
 [profile.release]
 debug = 1
+# Catch arithmetic overflow in the parsers, not just out-of-bounds access.
+overflow-checks = true
 
 [[bin]]
 name = "accuraterip"

@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Gauge, List, ListItem, Paragraph, Row, Table, Tabs};
 
-use crate::app::App;
+use crate::app::{Active, App};
 use crate::verify::{AlbumResult, TrackStatus, Verdict};
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
@@ -106,7 +106,7 @@ fn draw_progress(f: &mut Frame<'_>, app: &App, area: Rect) {
         None => (0.0, "Scanning for audio files…".to_string()),
         Some(0) => (1.0, "No audio files found".to_string()),
         Some(t) => {
-            let active: f32 = app.active.values().map(|a| a.1).sum();
+            let active: f32 = app.active.values().map(|a| a.peak).sum();
             let r = ((app.done as f32 + active) / t as f32).clamp(0.0, 1.0);
             let state = if app.finished() { "Done" } else { "Checking" };
             (r as f64, format!("{state}: {}/{} folders", app.done, t))
@@ -123,17 +123,19 @@ fn draw_progress(f: &mut Frame<'_>, app: &App, area: Rect) {
     );
     // By name, so that the list reads in order whatever thread checks what;
     // with more than fit, the last row counts the rest.
-    let mut active: Vec<&(String, f32)> = app.active.values().collect();
-    active.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut active: Vec<&Active> = app.active.values().collect();
+    active.sort_by(|a, b| a.name.cmp(&b.name));
     let shown = match active.len() > ACTIVE_ROWS {
         true => ACTIVE_ROWS - 1,
         false => active.len(),
     };
-    for ((name, frac), row) in active[..shown].iter().copied().zip(rows.iter().skip(1)) {
-        let line = Line::from(vec![
-            Span::raw(format!("{:>3.0}% ", frac * 100.0)).cyan(),
-            Span::raw(name.clone()).dim(),
-        ]);
+    for (a, row) in active[..shown].iter().zip(rows.iter().skip(1)) {
+        let mut spans = vec![Span::raw(format!("{:>3.0}% ", a.frac * 100.0)).cyan()];
+        if let Some(stage) = a.stage.label() {
+            spans.push(Span::raw(format!("{stage}: ")).yellow());
+        }
+        spans.push(Span::raw(a.name.clone()).dim());
+        let line = Line::from(spans);
         f.render_widget(Paragraph::new(line), *row);
     }
     if active.len() > shown {
@@ -327,7 +329,19 @@ mod tests {
             app.total = Some(10);
             app.sources = "CTDB + AccurateRip";
             for (w, n) in names.iter().enumerate() {
-                app.active.insert(w, (n.to_string(), 0.5));
+                app.active.insert(
+                    w,
+                    Active {
+                        name: n.to_string(),
+                        frac: 0.5,
+                        peak: 0.5,
+                        // A folder named "r" is on a second pass.
+                        stage: match *n {
+                            "r" => crate::verify::Stage::Realign,
+                            _ => crate::verify::Stage::Check,
+                        },
+                    },
+                );
             }
             let mut term = ratatui::Terminal::new(TestBackend::new(40, 7)).unwrap();
             term.draw(|f| draw_progress(f, &app, f.area())).unwrap();
@@ -349,6 +363,7 @@ mod tests {
             rows(&["f", "e", "d", "c", "b", "a"]),
             [" 50% a", " 50% b", " 50% c", "     … and 3 more"]
         );
+        assert_eq!(rows(&["r", "a"]), [" 50% a", " 50% realigning: r", "", ""]);
     }
 
     #[test]

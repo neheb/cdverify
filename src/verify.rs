@@ -210,7 +210,33 @@ pub fn internal_error(
     result
 }
 
-pub type Progress<'a> = &'a mut dyn FnMut(f32);
+/// What an album's check is doing: each pass over its audio starts again
+/// from 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// The first decode, for AccurateRip and CTDB at once.
+    Check,
+    /// AccurateRip checksums at other pressings' offsets.
+    Offsets,
+    /// Realigning a sample slip against CTDB.
+    Realign,
+    /// Checking against CTDB's repair data, or writing repaired copies.
+    Repair,
+}
+
+impl Stage {
+    /// What to show beside the progress, if anything.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Stage::Check => None,
+            Stage::Offsets => Some("pressing offsets"),
+            Stage::Realign => Some("realigning"),
+            Stage::Repair => Some("repairing"),
+        }
+    }
+}
+
+pub type Progress<'a> = &'a mut dyn FnMut(Stage, f32);
 
 /// A result with every track unchecked.
 fn blank_result(job: &AlbumJob) -> AlbumResult {
@@ -424,7 +450,7 @@ pub fn verify_with(
                 buffer = None;
             }
         }
-        progress((pos + frames.len() as u64) as f32 / total);
+        progress(Stage::Check, (pos + frames.len() as u64) as f32 / total);
     });
     if let Some(c) = ctdb {
         c.notes = Some(notes.clone());
@@ -489,12 +515,12 @@ pub fn verify_with(
         .map(|&o| OffsetAccum::new(o, bounds.clone()))
         .collect();
     if !accs.is_empty() {
-        progress(0.0);
+        progress(Stage::Offsets, 0.0);
         decode::decode_album(&job.tracks, false, |pos, frames| {
             for a in accs.iter_mut() {
                 a.push(pos, frames);
             }
-            progress((pos + frames.len() as u64) as f32 / total);
+            progress(Stage::Offsets, (pos + frames.len() as u64) as f32 / total);
         });
         crcs.extend(accs.iter().map(|a| (a.offset, a.finish())));
     }
@@ -847,7 +873,7 @@ pub fn verify_ctdb_first(
     let analysis = match (prep.pass, prep.notes) {
         (Some(Ok(pass)), Some(notes)) => pass.finish(&notes, db),
         (Some(Err(e)), _) => Err(e),
-        _ => repair::analyze(job, &toc, db, progress),
+        _ => repair::analyze(job, &toc, db, &mut |f| progress(Stage::Check, f)),
     };
     // A track whose FLAC MD5 doesn't match is Corrupted, as in --ar-first mode,
     // even if its audio matches CTDB: AccurateRip's check reports it.
@@ -876,7 +902,9 @@ pub fn verify_ctdb_first(
         if outcome == Outcome::NotRepairable
             && let Some(slip) = ar.slip
         {
-            (outcome, msg) = crate::slip::run(job, &toc, db, slip, dest, progress);
+            (outcome, msg) = crate::slip::run(job, &toc, db, slip, dest, &mut |f| {
+                progress(Stage::Realign, f)
+            });
         }
         ar.ctdb_known = outcome != Outcome::Failed;
         ar.ctdb_toc = Some(toc);

@@ -13,7 +13,7 @@ use ratatui::widgets::ListState;
 
 use crate::cache::{Cache, FileStamp};
 use crate::report;
-use crate::verify::{AlbumResult, Verdict};
+use crate::verify::{AlbumResult, Stage, Verdict};
 
 pub enum Event {
     /// Number of folders to process, once scanning finishes.
@@ -24,6 +24,7 @@ pub enum Event {
     },
     Progress {
         worker: usize,
+        stage: Stage,
         frac: f32,
     },
     /// Progress or outcome of a repair started with `r`.
@@ -63,12 +64,23 @@ pub struct Repairer {
     pub out: Option<PathBuf>,
 }
 
+/// A folder being checked.
+pub struct Active {
+    pub name: String,
+    /// Progress through the current pass over the audio.
+    pub frac: f32,
+    /// The most progress seen, which the overall gauge counts so that a
+    /// second pass doesn't move it backwards.
+    pub peak: f32,
+    pub stage: Stage,
+}
+
 pub struct App {
     pub albums: Vec<AlbumResult>,
     pub total: Option<usize>,
     pub done: usize,
     /// Per worker: (folder being processed, progress within it).
-    pub active: BTreeMap<usize, (String, f32)>,
+    pub active: BTreeMap<usize, Active>,
     pub tab: usize,
     pub lists: [ListState; Verdict::ALL.len()],
     pub detail_scroll: usize,
@@ -135,11 +147,25 @@ impl App {
         match ev {
             Event::Total(n) => self.total = Some(n),
             Event::Started { worker, label } => {
-                self.active.insert(worker, (label, 0.0));
+                self.active.insert(
+                    worker,
+                    Active {
+                        name: label,
+                        frac: 0.0,
+                        peak: 0.0,
+                        stage: Stage::Check,
+                    },
+                );
             }
-            Event::Progress { worker, frac } => {
+            Event::Progress {
+                worker,
+                stage,
+                frac,
+            } => {
                 if let Some(a) = self.active.get_mut(&worker) {
-                    a.1 = frac;
+                    a.frac = frac;
+                    a.peak = a.peak.max(frac);
+                    a.stage = stage;
                 }
             }
             Event::Repair {

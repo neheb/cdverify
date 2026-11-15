@@ -224,7 +224,7 @@ fn maybe_repair(
     ro: &RepairOptions,
     write: bool,
     known: Option<(repair::Outcome, String)>,
-    progress: &mut dyn FnMut(f32),
+    progress: verify::Progress<'_>,
 ) {
     // Already checked against CTDB (CTDB first).
     if album.repair_outcome.is_some() {
@@ -239,8 +239,11 @@ fn maybe_repair(
             .as_ref()
             .filter(|_| write)
             .map(|o| repair::destination(o, root, &job.dir));
-        let (outcome, msg) = known
-            .unwrap_or_else(|| repair::run(job, &toc, db, album.slip, dest.as_deref(), progress));
+        let (outcome, msg) = known.unwrap_or_else(|| {
+            repair::run(job, &toc, db, album.slip, dest.as_deref(), &mut |f| {
+                progress(verify::Stage::Repair, f)
+            })
+        });
         if album.verdict == verify::Verdict::RipErrors || album.slip.is_some() {
             album.reason = format!("{}; {}", album.reason, outcome.verdict_note());
         }
@@ -267,7 +270,7 @@ fn check_album(
     both: bool,
     ro: &RepairOptions,
     other: Option<verify::AlbumResult>,
-    progress: &mut dyn FnMut(f32),
+    progress: verify::Progress<'_>,
 ) -> (verify::AlbumResult, Option<verify::AlbumResult>) {
     let dest = ro
         .out
@@ -321,18 +324,16 @@ fn check_both(
     opts: &Options,
     dest: Option<&std::path::Path>,
     ro: &RepairOptions,
-    progress: &mut dyn FnMut(f32),
+    progress: verify::Progress<'_>,
 ) -> (verify::AlbumResult, verify::AlbumResult) {
     // CTDB's parity pass shares AccurateRip's first decode.
     let mut prep = verify::CtdbPrep::new(job, db);
-    let mut normal = verify::verify_with(job, db, opts, prep.as_mut(), &mut |f| progress(f / 2.0));
+    let mut normal = verify::verify_with(job, db, opts, prep.as_mut(), progress);
     // Only this run's mode writes repaired copies: the two modes' CTDB
     // checks can be for different TOCs, and so different repairs.
     let dest = dest.filter(|_| opts.ctdb_first);
     let (inverted, checked) =
-        verify::verify_ctdb_first(job, db, opts, dest, Some(&normal), prep, &mut |f| {
-            progress(0.5 + f / 2.0)
-        });
+        verify::verify_ctdb_first(job, db, opts, dest, Some(&normal), prep, progress);
     // --ar-first mode's CTDB check is the same one if it's for the same TOC.
     // In --ar-first mode with --repair, a repairable album is checked again to
     // write its copy (a rare second decode).
@@ -475,9 +476,10 @@ fn check_folder(
         .iter()
         .enumerate()
         .map(|(i, job)| {
-            let mut progress = |frac: f32| {
+            let mut progress = |stage, frac: f32| {
                 let _ = tx.send(Event::Progress {
                     worker,
+                    stage,
                     frac: (i as f32 + frac) / n,
                 });
             };

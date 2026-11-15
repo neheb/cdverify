@@ -570,16 +570,34 @@ pub fn verify_with(
         };
     }
 
-    // Every offset each track matches at: a disc can be in AccurateRip as
-    // several pressings, and a track's best match needn't be its neighbour's.
+    // Every offset each track is known to line up at: a disc can be in
+    // AccurateRip as several pressings, and a track's best match needn't be
+    // its neighbour's. A matching frame-450 checksum counts too: some
+    // entries have only that, and some submissions' full checksums are at
+    // offsets that drift from track to track.
     let matching: Vec<Vec<i64>> = (0..n)
         .map(|k| {
-            crcs.iter()
-                .filter(|(_, c)| {
-                    find_match(k, &c[k], pressings.as_deref().map(|p| &p[..])).confidence > 0
-                })
+            let ps = pressings.as_deref().map(|p| &p[..]);
+            let mut offsets: Vec<i64> = crcs
+                .iter()
+                .filter(|(_, c)| find_match(k, &c[k], ps).confidence > 0)
                 .map(|(o, _)| *o)
-                .collect()
+                .collect();
+            let targets: Vec<u32> = ps
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|p| p.entries.get(k))
+                .map(|e| e.crc450)
+                .filter(|&c| c != 0)
+                .collect();
+            let range = windows.range();
+            for (i, c) in windows.crc450_all(k).iter().enumerate() {
+                let o = i as i64 - range;
+                if targets.contains(c) && !offsets.contains(&o) {
+                    offsets.push(o);
+                }
+            }
+            offsets
         })
         .collect();
 

@@ -67,10 +67,12 @@ struct Cli {
     /// CDs that AccurateRip doesn't know by their audio tracks alone.
     #[arg(long)]
     no_ctdb: bool,
-    /// Use CTDB as the primary source: albums matching CTDB's parity data are
-    /// accurate, and only those that don't are checked against AccurateRip.
-    #[arg(long, conflicts_with = "no_ctdb")]
-    invert: bool,
+    /// Use AccurateRip as the primary source, consulting CTDB only for
+    /// layout lookups and repair data. By default CTDB comes first: albums
+    /// matching CTDB's parity data are accurate, and only those that don't
+    /// are checked against AccurateRip.
+    #[arg(long)]
+    ar_first: bool,
     /// Repair albums with ripping errors using CTDB's repair data, writing
     /// corrected copies of the damaged tracks under this folder (mirroring
     /// the library layout). The library itself is never modified.
@@ -93,13 +95,14 @@ fn main() -> Result<std::process::ExitCode> {
     if !cli.dir.is_dir() {
         anyhow::bail!("{} is not a folder", cli.dir.display());
     }
+    let ctdb_first = !cli.no_ctdb && !cli.ar_first;
     let opts = Options {
         min_confidence: cli.min_confidence,
         use_tags: !cli.no_tag,
         offset_range: cli.offset_range,
         max_candidates: 4,
         use_ctdb: !cli.no_ctdb,
-        ctdb_first: cli.invert,
+        ctdb_first,
     };
     let threads = cli
         .threads
@@ -107,7 +110,7 @@ fn main() -> Result<std::process::ExitCode> {
         .max(1);
 
     let cache_path = cli.cache.clone().unwrap_or_else(cache::default_path);
-    let cache = Cache::load(&cache_path, cli.invert);
+    let cache = Cache::load(&cache_path, ctdb_first);
     let prior = (!cli.rescan).then(|| Arc::new(cache.clone()));
 
     let repair_opts = RepairOptions {
@@ -127,7 +130,7 @@ fn main() -> Result<std::process::ExitCode> {
         root: root.clone(),
         out: cli.repair.clone().or_else(repair::default_out),
     });
-    // Work out both modes' results (normal and --invert) so a later run in
+    // Work out both modes' results (CTDB first and --ar-first) so a later run in
     // either mode comes from the cache; without CTDB there's only one.
     let both = !cli.no_ctdb;
     start(
@@ -166,7 +169,7 @@ struct RepairOptions {
     check_all: bool,
 }
 
-/// Whether normal mode checks this album against CTDB's parity data.
+/// Whether --ar-first mode checks this album against CTDB's parity data.
 fn wants_repair(album: &verify::AlbumResult, ro: &RepairOptions) -> bool {
     ro.check_all
         || (album.verdict == verify::Verdict::RipErrors
@@ -175,7 +178,7 @@ fn wants_repair(album: &verify::AlbumResult, ro: &RepairOptions) -> bool {
 }
 
 /// Undoes [`maybe_repair`] on a cached result, so it can be reused as the
-/// AccurateRip half of an --invert check.
+/// AccurateRip half of a CTDB-first check.
 fn without_repair(album: &verify::AlbumResult) -> verify::AlbumResult {
     let mut album = album.clone();
     if let Some(outcome) = album.repair_outcome.take() {
@@ -195,7 +198,7 @@ fn without_repair(album: &verify::AlbumResult) -> verify::AlbumResult {
 
 /// Checks albums with ripping errors against CTDB's parity data (every
 /// album with `check_all`), writing repaired copies when `--repair` is given
-/// and `write` is set (this run is in normal mode: only the run's own mode
+/// and `write` is set (this run is in --ar-first mode: only the run's own mode
 /// writes, so the two modes never write different repairs to one place).
 #[expect(
     clippy::too_many_arguments,
@@ -211,7 +214,7 @@ fn maybe_repair(
     known: Option<(repair::Outcome, String)>,
     progress: &mut dyn FnMut(f32),
 ) {
-    // Already checked against CTDB (--invert).
+    // Already checked against CTDB (CTDB first).
     if album.repair_outcome.is_some() {
         return;
     }
@@ -318,8 +321,8 @@ fn check_both(
         verify::verify_ctdb_first(job, db, opts, dest, Some(&normal), prep, &mut |f| {
             progress(0.5 + f / 2.0)
         });
-    // Normal mode's CTDB check is the same one if it's for the same TOC.
-    // In normal mode with --repair, a repairable album is checked again to
+    // --ar-first mode's CTDB check is the same one if it's for the same TOC.
+    // In --ar-first mode with --repair, a repairable album is checked again to
     // write its copy (a rare second decode).
     let write = !opts.ctdb_first;
     let known = checked

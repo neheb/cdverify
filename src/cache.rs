@@ -4,8 +4,8 @@
 //!
 //! A folder's results are reused when its audio files are unchanged (same
 //! names, sizes and modification times). Only final results are stored; see
-//! [`AlbumResult::recheck`]. `--invert` runs keep their own entries, so
-//! switching modes doesn't throw away the other mode's results.
+//! [`AlbumResult::recheck`]. CTDB-first (default) and `--ar-first` runs
+//! keep separate entries, so switching modes doesn't throw away the other mode's results.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ pub struct Entry {
 pub struct Cache {
     version: u32,
     folders: HashMap<PathBuf, Entry>,
-    /// Results of `--invert` runs.
+    /// Results of CTDB-first (default) runs.
     #[serde(default)]
     inverted: HashMap<PathBuf, Entry>,
     /// Which of the two this run uses.
@@ -81,7 +81,7 @@ pub fn default_path() -> PathBuf {
 
 impl Cache {
     /// Loads the cache, starting empty if it is missing or unreadable.
-    /// `ctdb_first` picks the `--invert` entries.
+    /// `ctdb_first` picks the CTDB-first entries.
     pub fn load(path: &Path, ctdb_first: bool) -> Cache {
         let mut c = std::fs::read(path)
             .ok()

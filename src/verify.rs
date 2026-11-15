@@ -75,7 +75,7 @@ pub enum TrackStatus {
     Accurate,
     /// Accurate according to a dBpoweramp `ACCURATERIPRESULT` tag.
     AccurateTag,
-    /// The whole rip matches a CTDB entry (`--invert`).
+    /// The whole rip matches a CTDB entry (CTDB first, the default).
     AccurateCtdb,
     LowConfidence,
     Mismatch,
@@ -157,7 +157,7 @@ pub struct AlbumResult {
     /// Explanation of a ripping error, e.g. a sample slip.
     #[serde(default)]
     pub diagnosis: Option<String>,
-    /// Checked with `--invert` (CTDB first).
+    /// Checked CTDB first (the default; not `--ar-first`).
     #[serde(default)]
     pub ctdb_first: bool,
     /// Checked by decoding with `--no-ctdb`: no layout lookups or repair
@@ -698,7 +698,7 @@ fn probe_incomplete(reason: &str) -> bool {
             .is_some_and(|r| r.contains("(0 Hz") || r.contains(" 0 bit") || r.contains(" 0 ch"))
 }
 
-/// The AccurateRip result for an --invert check: `ar` if given, else a fresh
+/// The AccurateRip result for a CTDB-first check: `ar` if given, else a fresh
 /// [`verify`].
 fn accuraterip(
     job: &AlbumJob,
@@ -715,7 +715,7 @@ fn accuraterip(
     ar
 }
 
-/// `--invert`: checks the album against CTDB's parity data and asks
+/// CTDB first (the default): checks the album against CTDB's parity data and asks
 /// AccurateRip only about albums that don't match it, reusing `ar` (a
 /// [`verify`] result) if given. `dest` is where repaired copies go
 /// (`--repair`). Also returns the CTDB check's outcome and description, if
@@ -760,7 +760,7 @@ pub fn verify_ctdb_first(
         (Some(Err(e)), _) => Err(e),
         _ => repair::analyze(job, &toc, db, progress),
     };
-    // A track whose FLAC MD5 doesn't match is Corrupted, as in normal mode,
+    // A track whose FLAC MD5 doesn't match is Corrupted, as in --ar-first mode,
     // even if its audio matches CTDB: AccurateRip's check reports it.
     let Some((confidence, offset)) = analysis
         .as_ref()

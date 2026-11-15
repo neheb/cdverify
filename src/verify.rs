@@ -15,6 +15,7 @@ use crate::decode;
 use crate::disc::{self, DiscId, SECTOR_FRAMES};
 use crate::repair::{self, Outcome};
 use crate::scan::AlbumJob;
+use crate::slip::Slip;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -157,6 +158,9 @@ pub struct AlbumResult {
     /// Explanation of a ripping error, e.g. a sample slip.
     #[serde(default)]
     pub diagnosis: Option<String>,
+    /// The sample slip the diagnosis describes, if it's a single one.
+    #[serde(default)]
+    pub slip: Option<Slip>,
     /// Checked CTDB first (the default; not `--ar-first`).
     #[serde(default)]
     pub ctdb_first: bool,
@@ -223,6 +227,7 @@ fn blank_result(job: &AlbumJob) -> AlbumResult {
         ctdb_toc: None,
         repair: None,
         diagnosis: None,
+        slip: None,
         ctdb_first: false,
         without_ctdb: false,
         offset_range: None,
@@ -558,6 +563,19 @@ pub fn verify_with(
         };
     }
 
+    // Every offset each track matches at: a disc can be in AccurateRip as
+    // several pressings, and a track's best match needn't be its neighbour's.
+    let matching: Vec<Vec<i64>> = (0..n)
+        .map(|k| {
+            crcs.iter()
+                .filter(|(_, c)| {
+                    find_match(k, &c[k], pressings.as_deref().map(|p| &p[..])).confidence > 0
+                })
+                .map(|(o, _)| *o)
+                .collect()
+        })
+        .collect();
+
     let count = |s: TrackStatus| result.tracks.iter().filter(|t| t.status == s).count();
     let n = result.tracks.len();
     // The last track of a data-first disc can't be verified, which is expected.
@@ -613,8 +631,11 @@ pub fn verify_with(
             ),
         )
     };
-    if result.verdict == Verdict::RipErrors {
-        result.diagnosis = sample_slip(&result.tracks);
+    if result.verdict == Verdict::RipErrors
+        && let Some((diagnosis, slip)) = sample_slip(&result.tracks, &matching)
+    {
+        result.diagnosis = Some(diagnosis);
+        result.slip = slip;
     }
     let toc = db::ctdb_toc(
         &disc::audio_offsets(&sectors),
@@ -622,7 +643,7 @@ pub fn verify_with(
         real_layout,
     );
     result.ctdb_toc = Some(toc.clone());
-    if result.verdict == Verdict::RipErrors && opts.use_ctdb && result.diagnosis.is_none() {
+    if result.verdict == Verdict::RipErrors && opts.use_ctdb {
         let note = match db::ctdb_repair_info(db, &toc) {
             Ok(Some((conf, parity))) => {
                 result.ctdb_known = true;
@@ -639,7 +660,7 @@ pub fn verify_with(
         result.ctdb_repair = Some(note);
     }
     if result.diagnosis.is_some() {
-        result.reason.push_str("; sample slip, re-rip needed");
+        result.reason.push_str("; sample slip");
     }
     result.recheck = needs_recheck(&result);
     result
@@ -671,6 +692,12 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
         // Probing again is cheap, and newer versions may open more files
         // or read more of their parameters.
         && albums.iter().all(|a| !probe_incomplete(&a.reason))
+        // Sample slips found before they could be repaired get another look.
+        && albums.iter().all(|a| {
+            !a.diagnosis
+                .as_deref()
+                .is_some_and(|d| d.contains("repair data can't fix"))
+        })
         // A check without CTDB skipped layout lookups and the repair check.
         && albums.iter().all(|a| !(a.without_ctdb && opts.use_ctdb))
         && albums
@@ -768,12 +795,19 @@ pub fn verify_ctdb_first(
         .filter(|a| !a.md5_mismatch)
         .and_then(|a| a.verified())
     else {
-        let (outcome, msg) = match &analysis {
+        let (mut outcome, mut msg) = match &analysis {
             Ok(a) => repair::finish(job, a, dest),
             Err(e) => repair::failed(e),
         };
         // Not a clean CTDB match: let AccurateRip have its say.
         let mut ar = accuraterip(job, db, opts, ar, progress);
+        // A sample slip is beyond the parity as ripped, but maybe not once
+        // realigned.
+        if outcome == Outcome::NotRepairable
+            && let Some(slip) = ar.slip
+        {
+            (outcome, msg) = crate::slip::run(job, &toc, db, slip, dest, progress);
+        }
         ar.ctdb_known = outcome != Outcome::Failed;
         ar.ctdb_toc = Some(toc);
         ar.repair_outcome = Some(outcome);
@@ -981,24 +1015,29 @@ fn shift_out_data_track(pressings: &[Pressing]) -> Vec<Pressing> {
         .collect()
 }
 
-/// Accurate tracks before and after a run of bad tracks matching at
-/// different offsets means the bad tracks gained or lost samples: the drive
-/// lost sync. Parity can't repair that; the tracks need re-ripping.
-fn sample_slip(tracks: &[TrackResult]) -> Option<String> {
+/// Accurate tracks before and after a run of bad tracks matching only at
+/// different offsets (`matching[k]` being every offset track `k` matches
+/// at) means the bad tracks gained or lost samples: the drive
+/// lost sync. As ripped that's beyond CTDB's parity; realigned it may not be
+/// (see [`crate::slip`]). Returns the diagnosis and, if there's one slip,
+/// the slip.
+fn sample_slip(tracks: &[TrackResult], matching: &[Vec<i64>]) -> Option<(String, Option<Slip>)> {
     let accurate = |t: &TrackResult| t.status == TrackStatus::Accurate;
     let mut notes = Vec::new();
-    let mut last_good: Option<&TrackResult> = None;
+    let mut slips = Vec::new();
+    let mut last_good: Option<(usize, &TrackResult)> = None;
     let mut bad: Vec<u32> = Vec::new();
-    for t in tracks {
+    for (k, t) in tracks.iter().enumerate() {
         if accurate(t) {
-            if let Some(prev) = last_good
+            if let Some((prev_k, prev)) = last_good
                 && prev.offset != t.offset
                 && !bad.is_empty()
+                && !matching[prev_k].iter().any(|o| matching[k].contains(o))
             {
                 let list: Vec<String> = bad.iter().map(u32::to_string).collect();
                 notes.push(format!(
                     "track{} {} shifted the audio by {} samples (track {} matches at offset {:+}, \
-                     track {} at {:+}): a drive sync error that repair data can't fix; re-rip {}",
+                     track {} at {:+}): a drive sync error; unless CTDB can repair it, re-rip {}",
                     if bad.len() == 1 { "" } else { "s" },
                     list.join(", "),
                     (t.offset - prev.offset).abs(),
@@ -1008,14 +1047,23 @@ fn sample_slip(tracks: &[TrackResult]) -> Option<String> {
                     t.offset,
                     if bad.len() == 1 { "it" } else { "them" },
                 ));
+                slips.push(Slip {
+                    first: prev_k + 1,
+                    last: k - 1,
+                    shift: t.offset - prev.offset,
+                });
             }
-            last_good = Some(t);
+            last_good = Some((k, t));
             bad.clear();
         } else if t.status == TrackStatus::Mismatch {
             bad.push(t.number);
         }
     }
-    (!notes.is_empty()).then(|| format!("Sample slip: {}", notes.join("; ")))
+    let slip = match slips[..] {
+        [one] => Some(one),
+        _ => None,
+    };
+    (!notes.is_empty()).then(|| (format!("Sample slip: {}", notes.join("; ")), slip))
 }
 
 /// Start of the reason for albums that aren't 44.1 kHz/16-bit stereo.
@@ -1192,15 +1240,28 @@ mod tests {
             track(2, 0, Mismatch),
             track(3, 42, Accurate),
         ];
-        let d = sample_slip(&slip).unwrap();
+        let best_only = |t: &[TrackResult]| t.iter().map(|t| vec![t.offset]).collect::<Vec<_>>();
+        let (d, s) = sample_slip(&slip, &best_only(&slip)).unwrap();
         assert!(d.contains("track 2 shifted the audio by 6 samples"), "{d}");
+        assert_eq!(
+            s,
+            Some(Slip {
+                first: 1,
+                last: 1,
+                shift: -6
+            })
+        );
         // Same offset on both sides: an ordinary ripping error, maybe repairable.
         let plain = [
             track(1, 42, Accurate),
             track(2, 0, Mismatch),
             track(3, 42, Accurate),
         ];
-        assert_eq!(sample_slip(&plain), None);
+        assert_eq!(sample_slip(&plain, &best_only(&plain)), None);
+        // Tracks 1 and 3 best match different pressings, but both match at
+        // +42 too: the rip is in one piece.
+        let both = vec![vec![48, 42], vec![], vec![42]];
+        assert_eq!(sample_slip(&slip, &both), None);
     }
 
     #[test]

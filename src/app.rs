@@ -341,6 +341,7 @@ impl App {
             return;
         };
         let (dir, title) = (album.dir.clone(), album.title.clone());
+        let slip = album.slip;
         let paths: Vec<PathBuf> = album.tracks.iter().map(|t| t.path.clone()).collect();
         let (tx, db) = (r.tx.clone(), r.db.clone());
         let Some(out) = &r.out else {
@@ -376,7 +377,7 @@ impl App {
                         });
                     }
                 };
-                crate::repair::run(&job, &toc, &db, Some(&dest), &mut progress)
+                crate::repair::run(&job, &toc, &db, slip, Some(&dest), &mut progress)
             }))
             .unwrap_or_else(|_| {
                 (

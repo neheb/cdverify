@@ -23,6 +23,7 @@ use crate::disc::SECTOR_FRAMES;
 use crate::flacout;
 use crate::parity::{self, Fix, Geometry, MAX_NPAR, ParityEncoder};
 use crate::scan::AlbumJob;
+use crate::slip::Slip;
 
 /// What one CTDB entry says about the rip.
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +147,19 @@ impl Analysis {
             EntryStatus::Verified { confidence, offset } => Some((*confidence, *offset)),
             _ => None,
         })
+    }
+
+    /// The corrections that make the rip match CTDB: none if it already
+    /// does, else the most confident repair. With that entry's confidence
+    /// and offset.
+    pub fn fix_plan(&self) -> Option<(u32, i64, &[Fix])> {
+        match self.verified() {
+            Some((conf, offset)) => Some((conf, offset, &[])),
+            None => self
+                .plan
+                .as_ref()
+                .map(|(conf, offset, fixes)| (*conf, *offset, &fixes[..])),
+        }
     }
 
     pub fn repairable(&self) -> bool {
@@ -396,13 +410,13 @@ const OLD_STRIDE: usize = 5880;
 
 /// The entry's parity stride in frames. Entries without `stride` are old
 /// ones, which always used [`OLD_STRIDE`].
-fn entry_stride(e: &CtdbEntry) -> usize {
+pub fn entry_stride(e: &CtdbEntry) -> usize {
     e.stride.unwrap_or(OLD_STRIDE)
 }
 
 /// The entry's parity words per column. Entries without `npar` are old
 /// ones, which always used 8.
-fn entry_npar(e: &CtdbEntry) -> usize {
+pub fn entry_npar(e: &CtdbEntry) -> usize {
     e.npar.unwrap_or(8).min(MAX_NPAR)
 }
 
@@ -415,7 +429,7 @@ fn entry_syndrome(e: &CtdbEntry) -> Option<Vec<u16>> {
     }
 }
 
-fn track_bounds(job: &AlbumJob) -> Result<Arc<[u64]>> {
+pub fn track_bounds(job: &AlbumJob) -> Result<Arc<[u64]>> {
     let mut b = vec![0u64];
     let mut end = 0;
     for t in &job.tracks {
@@ -431,7 +445,8 @@ fn track_bounds(job: &AlbumJob) -> Result<Arc<[u64]>> {
     Ok(b.into())
 }
 
-fn affected_tracks(bounds: &[u64], fixes: &[Fix]) -> Vec<u32> {
+/// The tracks (numbered from 1 by position) that `fixes` change.
+pub fn affected_tracks(bounds: &[u64], fixes: &[Fix]) -> Vec<u32> {
     let mut tracks: Vec<u32> = fixes
         .iter()
         .map(|f| bounds.partition_point(|&b| b <= (f.word / 2) as u64) as u32)
@@ -443,13 +458,19 @@ fn affected_tracks(bounds: &[u64], fixes: &[Fix]) -> Vec<u32> {
 /// Checks the album against CTDB's parity and, if it's repairable and `dest`
 /// is given, writes corrected copies of the affected tracks there. Returns
 /// the outcome and a one-line description.
+/// With `slip`, a sample slip AccurateRip found, the album is realigned
+/// first (see [`slip`](crate::slip)).
 pub fn run(
     job: &AlbumJob,
     toc: &str,
     db: &Db,
+    slip: Option<Slip>,
     dest: Option<&Path>,
     progress: &mut dyn FnMut(f32),
 ) -> (Outcome, String) {
+    if let Some(slip) = slip {
+        return crate::slip::run(job, toc, db, slip, dest, progress);
+    }
     match analyze(job, toc, db, progress) {
         Ok(a) => finish(job, &a, dest),
         Err(e) => failed(&e),
@@ -517,30 +538,8 @@ pub fn write_repaired(
         .ok_or_else(|| anyhow!("nothing to repair"))?;
     let bounds = &analysis.bounds;
     let tracks = affected_tracks(bounds, fixes);
-    std::fs::create_dir_all(out_dir)?;
-    // Repaired copies must never replace the originals.
-    let out_canon = std::fs::canonicalize(out_dir)?;
-    for t in &job.tracks {
-        if let Some(parent) = t.path.parent()
-            && std::fs::canonicalize(parent).is_ok_and(|p| p == out_canon)
-        {
-            bail!(
-                "the output folder {} is the album's own folder; choose a different --repair folder",
-                out_dir.display()
-            );
-        }
-    }
-    // The files to rewrite, as ranges of the tracks they hold.
-    let mut files: Vec<(usize, usize)> = Vec::new();
-    for &number in &tracks {
-        let k = number as usize - 1;
-        let same = |i: &usize| job.tracks[*i].path == job.tracks[k].path;
-        let first = (0..=k).rev().take_while(same).last().unwrap_or(k);
-        let last = (k..job.tracks.len()).take_while(same).last().unwrap_or(k);
-        if !files.contains(&(first, last + 1)) {
-            files.push((first, last + 1));
-        }
-    }
+    prepare_out_dir(job, out_dir)?;
+    let files = file_ranges(job, tracks.iter().map(|&n| n as usize - 1));
     // Every file is written and checked before any is put in place, so a
     // failure part-way leaves no partial set behind.
     let mut staged = Vec::new();
@@ -593,6 +592,40 @@ pub fn write_repaired(
         .map(flacout::Staged::commit)
         .collect::<Result<Vec<_>>>()?;
     Ok((written, encoder))
+}
+
+/// Creates `out_dir` for repaired copies of `job`'s files, refusing the
+/// album's own folder: repaired copies must never replace the originals.
+pub fn prepare_out_dir(job: &AlbumJob, out_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    let out_canon = std::fs::canonicalize(out_dir)?;
+    for t in &job.tracks {
+        if let Some(parent) = t.path.parent()
+            && std::fs::canonicalize(parent).is_ok_and(|p| p == out_canon)
+        {
+            bail!(
+                "the output folder {} is the album's own folder; choose a different --repair folder",
+                out_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The files holding the tracks at indices `tracks`, as ranges of the
+/// album's tracks they hold (a CD image holds several), in album order.
+pub fn file_ranges(job: &AlbumJob, tracks: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
+    let mut files: Vec<(usize, usize)> = Vec::new();
+    for k in tracks {
+        let same = |i: &usize| job.tracks[*i].path == job.tracks[k].path;
+        let first = (0..=k).rev().take_while(same).last().unwrap_or(k);
+        let last = (k..job.tracks.len()).take_while(same).last().unwrap_or(k);
+        if !files.contains(&(first, last + 1)) {
+            files.push((first, last + 1));
+        }
+    }
+    files.sort_unstable();
+    files
 }
 
 /// IEEE CRC32, as used by CTDB.

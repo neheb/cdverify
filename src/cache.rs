@@ -317,6 +317,7 @@ mod tests {
             ctdb_toc: None,
             repair: None,
             diagnosis: None,
+            slip: None,
             ctdb_first: false,
             without_ctdb: false,
             offset_range: None,

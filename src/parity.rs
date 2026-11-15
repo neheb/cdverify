@@ -783,6 +783,29 @@ pub fn compute_fixes(
     Some(fixes)
 }
 
+/// The syndrome (`syn.len()` words) of one column whose words in strides
+/// `1..=stridecount` are `rows`, as [`ParityEncoder::syndrome`] gives it at
+/// offset 0: `syn[n] = Σ rows[r] α^(n (stridecount - 1 - r))`.
+pub fn column_syndrome(syn: &mut [u16], rows: impl IntoIterator<Item = u16>) {
+    let g = Galois::get();
+    syn.fill(0);
+    for v in rows {
+        for (n, s) in syn.iter_mut().enumerate() {
+            *s = (g.mul_exp(*s as u32, n) ^ v as u32) as u16;
+        }
+    }
+}
+
+/// Changes a [`column_syndrome`] for its word at `row` changing by `diff`
+/// (XOR), in a column of `stridecount` rows.
+pub fn change_row(syn: &mut [u16], stridecount: usize, row: usize, diff: u16) {
+    let g = Galois::get();
+    let k = stridecount - 1 - row;
+    for (n, s) in syn.iter_mut().enumerate() {
+        *s ^= g.mul_exp(diff as u32, (n * k) % MAX) as u16;
+    }
+}
+
 /// CTDB's CRC32 window: frames `[stride/2 + oi, N - laststride/2 + oi)` with
 /// `oi = -offset`.
 pub fn crc_window(geo: Geometry, offset: i64) -> (u64, u64) {
@@ -920,6 +943,31 @@ mod tests {
             assert_eq!(ours[i as usize], theirs[j], "frame {i}");
         }
         assert_eq!(offset, -(shift as i64));
+    }
+
+    #[test]
+    fn column_syndromes_match_encoder() {
+        let stride = 64;
+        let frames = noise(stride / 2 * 30 + 9, 4);
+        let enc = encode(&frames, stride);
+        let geo = enc.geometry();
+        let npar = 8;
+        let syn = enc.syndrome(npar, stride, 0);
+        let word = |w: usize| (frames[w / 2] >> (w % 2 * 16)) as u16;
+        for c in [0, 1, 17, stride - 1] {
+            let rows = (1..=geo.stridecount).map(|r| word(r * stride + c));
+            let mut ours = vec![0; npar];
+            column_syndrome(&mut ours, rows);
+            assert_eq!(ours, syn[c * npar..(c + 1) * npar], "column {c}");
+            // Changing a word and updating matches recomputing.
+            let (row, diff) = (5, 0x1234);
+            change_row(&mut ours, geo.stridecount, row, diff);
+            let rows = (1..=geo.stridecount)
+                .map(|r| word(r * stride + c) ^ if r == row + 1 { diff } else { 0 });
+            let mut want = vec![0; npar];
+            column_syndrome(&mut want, rows);
+            assert_eq!(ours, want, "column {c} changed");
+        }
     }
 
     #[test]

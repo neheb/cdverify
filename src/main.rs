@@ -14,6 +14,7 @@ mod parity;
 mod repair;
 mod report;
 mod scan;
+mod slip;
 mod ui;
 mod verify;
 
@@ -174,7 +175,7 @@ fn wants_repair(album: &verify::AlbumResult, ro: &RepairOptions) -> bool {
     ro.check_all
         || (album.verdict == verify::Verdict::RipErrors
             && album.ctdb_known
-            && album.diagnosis.is_none())
+            && (album.diagnosis.is_none() || album.slip.is_some()))
 }
 
 /// Undoes [`maybe_repair`] on a cached result, so it can be reused as the
@@ -225,8 +226,8 @@ fn maybe_repair(
             .as_ref()
             .filter(|_| write)
             .map(|o| repair::destination(o, root, &job.dir));
-        let (outcome, msg) =
-            known.unwrap_or_else(|| repair::run(job, &toc, db, dest.as_deref(), progress));
+        let (outcome, msg) = known
+            .unwrap_or_else(|| repair::run(job, &toc, db, album.slip, dest.as_deref(), progress));
         if album.verdict == verify::Verdict::RipErrors {
             album.reason = format!("{}; {}", album.reason, outcome.verdict_note());
         }

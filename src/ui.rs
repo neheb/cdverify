@@ -121,12 +121,24 @@ fn draw_progress(f: &mut Frame<'_>, app: &App, area: Rect) {
             .label(format!("{label:<w$}", w = rows[0].width as usize)),
         rows[0],
     );
-    for ((name, frac), row) in app.active.values().zip(rows.iter().skip(1)) {
+    // By name, so that the list reads in order whatever thread checks what;
+    // with more than fit, the last row counts the rest.
+    let mut active: Vec<&(String, f32)> = app.active.values().collect();
+    active.sort_by(|a, b| a.0.cmp(&b.0));
+    let shown = match active.len() > ACTIVE_ROWS {
+        true => ACTIVE_ROWS - 1,
+        false => active.len(),
+    };
+    for ((name, frac), row) in active[..shown].iter().copied().zip(rows.iter().skip(1)) {
         let line = Line::from(vec![
             Span::raw(format!("{:>3.0}% ", frac * 100.0)).cyan(),
             Span::raw(name.clone()).dim(),
         ]);
         f.render_widget(Paragraph::new(line), *row);
+    }
+    if active.len() > shown {
+        let more = Line::from(format!("     … and {} more", active.len() - shown)).dim();
+        f.render_widget(Paragraph::new(more), rows[1 + shown]);
     }
 }
 
@@ -300,6 +312,40 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn lists_active_folders_by_name() {
+        use ratatui::backend::TestBackend;
+        let rows = |names: &[&str]| -> Vec<String> {
+            let mut app = App::new(
+                std::path::PathBuf::new(),
+                false,
+                crate::cache::Cache::default(),
+                std::path::PathBuf::new(),
+            );
+            app.total = Some(10);
+            for (w, n) in names.iter().enumerate() {
+                app.active.insert(w, (n.to_string(), 0.5));
+            }
+            let mut term = ratatui::Terminal::new(TestBackend::new(40, 7)).unwrap();
+            term.draw(|f| draw_progress(f, &app, f.area())).unwrap();
+            let buf = term.backend().buffer().clone();
+            (2..2 + ACTIVE_ROWS as u16)
+                .map(|y| {
+                    (1..39)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        };
+        assert_eq!(rows(&["c", "a", "b"]), [" 50% a", " 50% b", " 50% c", ""]);
+        assert_eq!(
+            rows(&["f", "e", "d", "c", "b", "a"]),
+            [" 50% a", " 50% b", " 50% c", "     … and 3 more"]
+        );
     }
 
     #[test]

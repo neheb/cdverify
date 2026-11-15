@@ -536,7 +536,7 @@ pub fn verify_with(
         }
         None => evaluate(None),
     };
-    result.pressings = pressings.as_ref().map_or(0, |p| p.len());
+    result.pressings = pressings.as_ref().map_or_default(|p| p.len());
 
     for (k, (offset, crc, m)) in best.into_iter().enumerate() {
         let t = &mut result.tracks[k];
@@ -1136,7 +1136,10 @@ fn candidate_offsets(
 ) -> Vec<i64> {
     let range = w.range();
     let mut hits = vec![0u32; 2 * range as usize + 1];
-    let ntracks = pressings.first().map_or(0, |p| p.entries.len()).min(tracks);
+    let ntracks = pressings
+        .first()
+        .map_or_default(|p| p.entries.len())
+        .min(tracks);
     for k in 0..ntracks {
         let targets: Vec<u32> = pressings
             .iter()

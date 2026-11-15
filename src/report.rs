@@ -32,9 +32,7 @@ pub fn write(path: &Path, albums: &[AlbumResult]) -> Result<(PathBuf, PathBuf)> 
 
 /// `<path>.<pid>.tmp`, next to `path`.
 fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.tmp", std::process::id()));
-    path.with_file_name(name)
+    path.with_added_extension(format!("{}.tmp", std::process::id()))
 }
 
 pub fn text(albums: &[AlbumResult]) -> String {

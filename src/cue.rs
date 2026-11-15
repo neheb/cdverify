@@ -52,7 +52,7 @@ pub fn parse_flac_block(data: &[u8]) -> Option<Vec<CueTrack>> {
     p += 1;
     let mut tracks = Vec::new();
     for _ in 0..ntracks {
-        let offset = u64::from_be_bytes(data.get(p..p + 8)?.try_into().ok()?);
+        let offset = u64::from_be_bytes(*data.get(p..p + 8)?.as_array()?);
         let number = *data.get(p + 8)?;
         // ISRC (12), then the type bit: set for non-audio tracks.
         let audio = data.get(p + 21)? & 0x80 == 0;
@@ -61,7 +61,7 @@ pub fn parse_flac_block(data: &[u8]) -> Option<Vec<CueTrack>> {
         let mut index1 = None;
         let mut first = None;
         for _ in 0..nindex {
-            let idx_off = u64::from_be_bytes(data.get(p..p + 8)?.try_into().ok()?);
+            let idx_off = u64::from_be_bytes(*data.get(p..p + 8)?.as_array()?);
             let idx = *data.get(p + 8)?;
             first.get_or_insert(idx_off);
             if idx == 1 {
@@ -134,7 +134,7 @@ pub fn file_name(text: &str) -> Option<String> {
 /// Reads a CUE file, which may be UTF-8 (with or without a BOM) or Latin-1.
 pub fn read_text(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    let bytes = bytes.trim_prefix(b"\xef\xbb\xbf");
     Some(match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
         Err(_) => bytes.iter().map(|&b| b as char).collect(),

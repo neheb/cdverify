@@ -200,7 +200,7 @@ mod tests {
             150, 9700, 25887, 39297, 53795, 63735, 77517, 94877, 107270, 123552, 135522, 148422,
             161197, 174790, 192022, 205545, 218010, 228700, 239590, 255470, 266932, 288750, 303602,
         ];
-        offsets.windows(2).map(|w| w[1] - w[0]).collect()
+        offsets.array_windows().map(|[a, b]| b - a).collect()
     }
 
     #[test]
@@ -226,7 +226,7 @@ mod tests {
         let offsets = [
             0, 16600, 29617, 52414, 62615, 79100, 91114, 101535, 119784, 144061,
         ];
-        let sectors: Vec<u32> = offsets.windows(2).map(|w| w[1] - w[0]).collect();
+        let sectors: Vec<u32> = offsets.array_windows().map(|[a, b]| b - a).collect();
         // The data track follows the audio session's lead-out/lead-in gap of 11400 sectors.
         let id = DiscId::with_data_track(&sectors, 144061 + 11400, 214798);
         assert_eq!(id.file_name(), "dBAR-009-000bb659-00586ea9-7c0b2f0a.bin");
@@ -241,7 +241,7 @@ mod tests {
             80066, 89099, 90315, 99609, 107138, 115809, 122179, 128520, 134566, 142793, 148597,
             156055, 158866, 160168, 160650,
         ];
-        let sectors: Vec<u32> = offsets.windows(2).map(|w| w[1] - w[0]).collect();
+        let sectors: Vec<u32> = offsets.array_windows().map(|[a, b]| b - a).collect();
         let id = DiscId::with_leading_data_track(&sectors, 134817, 134817 + 160650);
         assert_eq!(id.file_name(), "dBAR-027-005e6b02-060481bb-bc0f631c.bin");
     }
@@ -251,7 +251,7 @@ mod tests {
         // Cowboy Bebop: Vitaminless, track 1 at sector 37. AccurateRip lists it
         // as dBAR-008-00099162-003e0aa7-7106d808.bin; MusicBrainz knows the ID.
         let offsets = [0, 28280, 42580, 57333, 69760, 79038, 101515, 116798, 131405];
-        let sectors: Vec<u32> = offsets.windows(2).map(|w| w[1] - w[0]).collect();
+        let sectors: Vec<u32> = offsets.array_windows().map(|[a, b]| b - a).collect();
         let id = DiscId::with_pregap(&sectors, 37);
         assert_eq!(id.file_name(), "dBAR-008-00099162-003e0aa7-7106d808.bin");
         assert_eq!(musicbrainz_id(&sectors, 37), "9Ogj41zvgLsTmazs4l2NqkkkG8Q-");

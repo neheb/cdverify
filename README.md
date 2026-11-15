@@ -112,9 +112,15 @@ Not Found albums, corrupted tracks and failed lookups (AccurateRip or CTDB) are 
 
 ## Development
 
-CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test`, [`cargo deny check`](https://github.com/EmbarkStudios/cargo-deny)
+Building needs Rust 1.100 or later.
+
+CI runs `cargo fmt --check`, `cargo clippy --all-targets` (with
+`CARGO_BUILD_WARNINGS=deny`, which also covers Cargo's own lints such as
+unused dependencies), `cargo test`, [`cargo deny check`](https://github.com/EmbarkStudios/cargo-deny)
 (advisories and licenses, see `deny.toml`) and a short fuzzing run.
+`.cargo/config.toml` makes the resolver skip crate versions published less
+than a week ago, so a compromised release has time to be caught before
+`cargo update` picks it up.
 
 The fuzz targets in `fuzz/` cover the parsers of untrusted input (AccurateRip
 responses, CTDB XML, CUE sheets) and the parity decoder that repairs rips.

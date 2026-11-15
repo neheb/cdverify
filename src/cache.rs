@@ -5,9 +5,10 @@
 //! A folder's results are reused when its audio files are unchanged (same
 //! names, sizes and modification times). Only final results are stored; see
 //! [`AlbumResult::recheck`]. CTDB-first (default) and `--ar-first` runs
-//! keep separate entries, so switching modes doesn't throw away the other mode's results.
+//! keep separate entries, so switching modes doesn't throw away the other
+//! mode's results. Runs sharing a cache file merge their changes on save.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -42,6 +43,10 @@ pub struct Cache {
     /// Which of the two this run uses.
     #[serde(skip)]
     ctdb_first: bool,
+    /// Folders changed since loading or the last save, in `folders` and
+    /// `inverted`: only these are written over what is on disk.
+    #[serde(skip)]
+    touched: [HashSet<PathBuf>; 2],
 }
 
 /// Stats `files`; `None` if any of them can't be read.
@@ -83,14 +88,7 @@ impl Cache {
     /// Loads the cache, starting empty if it is missing or unreadable.
     /// `ctdb_first` picks the CTDB-first entries.
     pub fn load(path: &Path, ctdb_first: bool) -> Cache {
-        let mut c = std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Cache>(&b).ok())
-            .filter(|c| c.version == VERSION)
-            .unwrap_or_else(|| Cache {
-                version: VERSION,
-                ..Cache::default()
-            });
+        let mut c = read(path);
         c.ctdb_first = ctdb_first;
         c
     }
@@ -103,21 +101,51 @@ impl Cache {
         }
     }
 
-    fn entries_mut(&mut self, other: bool) -> &mut HashMap<PathBuf, Entry> {
+    /// Like [`Cache::entries`], with the set to record changed folders in.
+    fn entries_mut(
+        &mut self,
+        other: bool,
+    ) -> (&mut HashMap<PathBuf, Entry>, &mut HashSet<PathBuf>) {
+        let [folders, inverted] = &mut self.touched;
         match self.ctdb_first != other {
-            true => &mut self.inverted,
-            false => &mut self.folders,
+            true => (&mut self.inverted, inverted),
+            false => (&mut self.folders, folders),
         }
     }
 
-    /// Writes atomically (temporary file + rename).
-    pub fn save(&self, path: &Path) -> Result<()> {
+    /// Merges this run's changes into the cache on disk, under a lock so
+    /// that runs sharing the file don't lose each other's results, and
+    /// writes it atomically (temporary file + rename).
+    pub fn save(&mut self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        // Per process, so that two runs don't write into one file; the
-        // last rename wins.
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        // The cache file itself is replaced on every save, so lock a
+        // separate file. Released when `lock` is dropped.
+        let lock = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_added_extension("lock"))?;
+        lock.lock()?;
+        let mut merged = read(path);
+        for ((ours, theirs), touched) in [
+            (&self.folders, &mut merged.folders),
+            (&self.inverted, &mut merged.inverted),
+        ]
+        .into_iter()
+        .zip(&self.touched)
+        {
+            for dir in touched {
+                match ours.get(dir) {
+                    Some(e) => theirs.insert(dir.clone(), e.clone()),
+                    None => theirs.remove(dir),
+                };
+            }
+        }
+        // Per process, in case another run writes without the lock (one
+        // from before locking, or on a file system without locks).
+        let tmp = path.with_added_extension(format!("{}.tmp", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let written = std::fs::File::options()
             .write(true)
@@ -125,23 +153,35 @@ impl Cache {
             .open(&tmp)
             .and_then(|mut f| {
                 use std::io::Write;
-                f.write_all(&serde_json::to_vec(self)?)
+                f.write_all(&serde_json::to_vec(&merged)?)
             })
             .and_then(|()| std::fs::rename(&tmp, path));
         if written.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
-        Ok(written?)
+        written?;
+        self.touched = Default::default();
+        Ok(())
     }
 
     /// Forgets folders under `root` that aren't in `seen` (deleted or moved
     /// since), in both modes. Returns whether any were.
-    pub fn prune(&mut self, root: &Path, seen: &std::collections::HashSet<PathBuf>) -> bool {
-        let before = self.folders.len() + self.inverted.len();
-        for map in [&mut self.folders, &mut self.inverted] {
-            map.retain(|dir, _| !dir.starts_with(root) || seen.contains(dir));
+    pub fn prune(&mut self, root: &Path, seen: &HashSet<PathBuf>) -> bool {
+        let mut pruned = false;
+        for (map, touched) in [&mut self.folders, &mut self.inverted]
+            .into_iter()
+            .zip(&mut self.touched)
+        {
+            map.retain(|dir, _| {
+                let keep = !dir.starts_with(root) || seen.contains(dir);
+                if !keep {
+                    touched.insert(dir.clone());
+                    pruned = true;
+                }
+                keep
+            });
         }
-        self.folders.len() + self.inverted.len() != before
+        pruned
     }
 
     /// Cached results for `dir` if its files still match `files`.
@@ -156,7 +196,8 @@ impl Cache {
 
     /// Records a folder's results, or forgets it if any album needs rechecking.
     pub fn update(&mut self, dir: PathBuf, files: Option<Vec<FileStamp>>, albums: &[AlbumResult]) {
-        update(self.entries_mut(false), dir, files, albums);
+        let (entries, touched) = self.entries_mut(false);
+        update(entries, touched, dir, files, albums);
     }
 
     /// Changes one cached album of `dir` in this mode's entries, forgetting
@@ -168,7 +209,7 @@ impl Cache {
         title: &str,
         f: impl FnOnce(&mut AlbumResult),
     ) -> bool {
-        let entries = self.entries_mut(false);
+        let (entries, touched) = self.entries_mut(false);
         let Some(e) = entries.get_mut(dir) else {
             return false;
         };
@@ -179,6 +220,7 @@ impl Cache {
         if a.recheck {
             entries.remove(dir);
         }
+        touched.insert(dir.to_path_buf());
         true
     }
 
@@ -189,8 +231,21 @@ impl Cache {
         files: Option<Vec<FileStamp>>,
         albums: &[AlbumResult],
     ) {
-        update(self.entries_mut(true), dir, files, albums);
+        let (entries, touched) = self.entries_mut(true);
+        update(entries, touched, dir, files, albums);
     }
+}
+
+/// The cache at `path`, or an empty one if it is missing or unreadable.
+fn read(path: &Path) -> Cache {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Cache>(&b).ok())
+        .filter(|c| c.version == VERSION)
+        .unwrap_or_else(|| Cache {
+            version: VERSION,
+            ..Cache::default()
+        })
 }
 
 fn get(
@@ -210,10 +265,12 @@ fn get(
 
 fn update(
     entries: &mut HashMap<PathBuf, Entry>,
+    touched: &mut HashSet<PathBuf>,
     dir: PathBuf,
     files: Option<Vec<FileStamp>>,
     albums: &[AlbumResult],
 ) {
+    touched.insert(dir.clone());
     match files {
         Some(files) if !albums.iter().any(|a| a.recheck) => {
             entries.insert(
@@ -320,7 +377,35 @@ mod tests {
         assert!(loaded.get(Path::new("/b"), &[stamp(10)]).is_none());
         let loaded = Cache::load(&path, true);
         assert!(loaded.get(Path::new("/b"), &[stamp(10)]).is_some());
-        std::fs::remove_file(&path).unwrap();
-        std::fs::remove_dir(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_runs_keep_each_others_results() {
+        let dir = std::env::temp_dir().join(format!("cdverify-merge-test-{}", std::process::id()));
+        let path = dir.join("cache.json");
+        let mut seed = Cache::load(&path, false);
+        seed.update("/lib/old".into(), Some(vec![stamp(10)]), &[album(false)]);
+        seed.update("/lib/gone".into(), Some(vec![stamp(10)]), &[album(false)]);
+        seed.save(&path).unwrap();
+        // Two runs start from the same file.
+        let mut a = Cache::load(&path, false);
+        let mut b = Cache::load(&path, false);
+        a.update("/lib/a".into(), Some(vec![stamp(10)]), &[album(false)]);
+        let seen = ["/lib/old", "/lib/a"]
+            .map(PathBuf::from)
+            .into_iter()
+            .collect();
+        assert!(a.prune(Path::new("/lib"), &seen));
+        b.update("/other/b".into(), Some(vec![stamp(10)]), &[album(false)]);
+        a.save(&path).unwrap();
+        b.save(&path).unwrap();
+        let loaded = Cache::load(&path, false);
+        for d in ["/lib/old", "/lib/a", "/other/b"] {
+            assert!(loaded.get(Path::new(d), &[stamp(10)]).is_some(), "{d}");
+        }
+        // B's untouched copy of the pruned folder doesn't bring it back.
+        assert!(loaded.get(Path::new("/lib/gone"), &[stamp(10)]).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

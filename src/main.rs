@@ -183,9 +183,7 @@ fn without_repair(album: &verify::AlbumResult) -> verify::AlbumResult {
     let mut album = album.clone();
     if let Some(outcome) = album.repair_outcome.take() {
         let note = format!("; {}", outcome.verdict_note());
-        if let Some(reason) = album.reason.strip_suffix(&note) {
-            album.reason = reason.to_string();
-        }
+        album.reason = album.reason.trim_suffix(&note).to_string();
         if outcome == repair::Outcome::Verified {
             album.recheck = verify::needs_recheck(&album);
         }
@@ -449,7 +447,7 @@ fn check_folder(
         };
     }
     let other_hit = both.then(|| cached(true)).flatten();
-    let label = dir.strip_prefix(root).unwrap_or(dir).display().to_string();
+    let label = dir.trim_prefix(root).display().to_string();
     let _ = tx.send(Event::Started { worker, label });
     let tracks = scan::probe_files(files);
     let jobs = scan::group(dir, tracks);

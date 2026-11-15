@@ -57,7 +57,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     app.hit.list = left;
     app.hit.details = right;
 
-    let tracks = app.selected().map_or(0, |a| a.tracks.len());
+    let tracks = app.selected().map_or_default(|a| a.tracks.len());
     app.detail_scroll = app.detail_scroll.min(tracks.saturating_sub(1));
     let scroll = app.detail_scroll;
     match app.selected() {

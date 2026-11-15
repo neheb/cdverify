@@ -2,6 +2,7 @@
 name = "cdverify"
 version = "0.8.1"
 edition = "2024"
+rust-version = "1.100"
 authors = ["Rosen Penev"]
 description = "Verify CD rips against AccurateRip and CTDB, and repair them with CTDB parity data"
 license = "GPL-3.0-or-later"

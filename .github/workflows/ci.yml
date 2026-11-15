@@ -23,7 +23,9 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
       - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets
+        env:
+          CARGO_BUILD_WARNINGS: deny
 
   # The ARMv7 release's NEON parity code (cfg(neon), see build.rs) builds
   # only for that target: lint it and run the tests under QEMU.
@@ -45,7 +47,9 @@ jobs:
           targets: armv7-unknown-linux-musleabihf
           components: clippy
       - run: sudo apt-get update && sudo apt-get install -y qemu-user
-      - run: cargo clippy --locked --all-targets --target armv7-unknown-linux-musleabihf -- -D warnings
+      - run: cargo clippy --locked --all-targets --target armv7-unknown-linux-musleabihf
+        env:
+          CARGO_BUILD_WARNINGS: deny
       - run: cargo test --locked --target armv7-unknown-linux-musleabihf
 
   test:

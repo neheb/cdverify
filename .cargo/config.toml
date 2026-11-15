@@ -1,0 +1,4 @@
+# Don't pick up crate versions published in the last week (versions already
+# in Cargo.lock are kept), so a compromised release has time to be yanked.
+[registry]
+global-min-publish-age = "7 days"

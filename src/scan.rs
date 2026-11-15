@@ -339,7 +339,7 @@ impl AlbumJob {
         self.tracks
             .first()
             .and_then(|t| t.image_start)
-            .map_or(0, |s| (s / SECTOR_FRAMES) as u32)
+            .map_or_default(|s| (s / SECTOR_FRAMES) as u32)
     }
 }
 

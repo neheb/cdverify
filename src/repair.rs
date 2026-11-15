@@ -492,7 +492,7 @@ pub fn finish(job: &AlbumJob, analysis: &Analysis, dest: Option<&Path>) -> (Outc
 
 /// Where repaired copies of an album in `dir` go: `out` mirrors the library.
 pub fn destination(out: &Path, root: &Path, dir: &Path) -> PathBuf {
-    out.join(dir.strip_prefix(root).unwrap_or(dir))
+    out.join(dir.trim_prefix(root))
 }
 
 /// Default folder for repaired copies, if there's a home folder to put it in.

@@ -72,8 +72,13 @@ struct Cli {
     /// layout lookups and repair data. By default CTDB comes first: albums
     /// matching CTDB's parity data are accurate, and only those that don't
     /// are checked against AccurateRip.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "ctdb_only")]
     ar_first: bool,
+    /// Check against the CUETools database (CTDB) alone, never asking
+    /// AccurateRip. CTDB judges whole discs: albums it doesn't know are Not
+    /// Found, and there's no per-track result or sample slip detection.
+    #[arg(long, conflicts_with = "no_ctdb")]
+    ctdb_only: bool,
     /// Repair albums with ripping errors using CTDB's repair data, writing
     /// corrected copies of the damaged tracks under this folder (mirroring
     /// the library layout). The library itself is never modified.
@@ -104,6 +109,7 @@ fn main() -> Result<std::process::ExitCode> {
         max_candidates: 4,
         use_ctdb: !cli.no_ctdb,
         ctdb_first,
+        ctdb_only: cli.ctdb_only,
     };
     let threads = cli
         .threads
@@ -133,7 +139,8 @@ fn main() -> Result<std::process::ExitCode> {
     });
     // Work out both modes' results (CTDB first and --ar-first) so a later run in
     // either mode comes from the cache; without CTDB there's only one.
-    let both = !cli.no_ctdb;
+    // --ctdb-only answers a question of its own.
+    let both = !cli.no_ctdb && !cli.ctdb_only;
     start(
         root.clone(),
         threads,

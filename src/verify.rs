@@ -28,6 +28,9 @@ pub struct Options {
     /// Check against CTDB first; ask AccurateRip only about albums that
     /// don't match it.
     pub ctdb_first: bool,
+    /// Check against CTDB alone, never asking AccurateRip (implies
+    /// `ctdb_first`).
+    pub ctdb_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -164,6 +167,9 @@ pub struct AlbumResult {
     /// Checked CTDB first (the default; not `--ar-first`).
     #[serde(default)]
     pub ctdb_first: bool,
+    /// Checked against CTDB alone (`--ctdb-only`).
+    #[serde(default)]
+    pub ctdb_only: bool,
     /// Checked by decoding with `--no-ctdb`: no layout lookups or repair
     /// check, which a run with CTDB has to make up for.
     #[serde(default)]
@@ -229,6 +235,7 @@ fn blank_result(job: &AlbumJob) -> AlbumResult {
         diagnosis: None,
         slip: None,
         ctdb_first: false,
+        ctdb_only: false,
         without_ctdb: false,
         offset_range: None,
         tracks: job
@@ -688,7 +695,9 @@ pub fn needs_recheck(result: &AlbumResult) -> bool {
 /// Whether cached results still hold under the current options.
 pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
     // Results from the other mode answer a different question.
-    albums.iter().all(|a| a.ctdb_first == opts.ctdb_first)
+    albums
+        .iter()
+        .all(|a| a.ctdb_first == opts.ctdb_first && a.ctdb_only == opts.ctdb_only)
         // Probing again is cheap, and newer versions may open more files
         // or read more of their parameters.
         && albums.iter().all(|a| !probe_incomplete(&a.reason))
@@ -758,6 +767,7 @@ pub fn verify_ctdb_first(
 ) -> (AlbumResult, Option<(Outcome, String)>) {
     let mut result = blank_result(job);
     result.ctdb_first = true;
+    result.ctdb_only = opts.ctdb_only;
     if let Err(reason) = check_eligible(job) {
         result.reason = reason;
         return (result, None);
@@ -766,6 +776,17 @@ pub fn verify_ctdb_first(
     let prep = prep.unwrap_or_else(|| CtdbPrep::lookup(job, db));
     let layout = match prep.layout {
         Ok(Some(disc)) => disc.layout(),
+        Ok(None) if opts.ctdb_only => {
+            result.verdict = Verdict::NotFound;
+            result.reason = "Not in CTDB".into();
+            result.recheck = true;
+            return (result, None);
+        }
+        Err(e) if opts.ctdb_only => {
+            result.reason = format!("CTDB lookup failed: {e}");
+            result.recheck = true;
+            return (result, None);
+        }
         // CTDB can't say: AccurateRip has the final word.
         Ok(None) => {
             let mut ar = accuraterip(job, db, opts, ar, progress);
@@ -799,6 +820,14 @@ pub fn verify_ctdb_first(
             Ok(a) => repair::finish(job, a, dest),
             Err(e) => repair::failed(e),
         };
+        if opts.ctdb_only {
+            ctdb_only_verdict(&mut result, analysis.as_ref().ok(), outcome, &msg);
+            result.ctdb_known = outcome != Outcome::Failed;
+            result.ctdb_toc = Some(toc);
+            result.repair_outcome = Some(outcome);
+            result.repair = Some(msg.clone());
+            return (result, Some((outcome, msg)));
+        }
         // Not a clean CTDB match: let AccurateRip have its say.
         let mut ar = accuraterip(job, db, opts, ar, progress);
         // A sample slip is beyond the parity as ripped, but maybe not once
@@ -859,6 +888,46 @@ pub fn verify_ctdb_first(
     result.repair_outcome = Some(Outcome::Verified);
     let msg = analysis.map(|a| a.summary()).unwrap_or_default();
     (result, Some((Outcome::Verified, msg)))
+}
+
+/// Sets a `--ctdb-only` verdict for an album that isn't a clean CTDB match,
+/// from its CTDB check (`analysis`, if it ran to the end) and its outcome
+/// and message.
+/// CTDB judges the whole disc, so only the tracks a repair would change are
+/// marked.
+fn ctdb_only_verdict(
+    result: &mut AlbumResult,
+    analysis: Option<&repair::Analysis>,
+    outcome: Outcome,
+    msg: &str,
+) {
+    (result.verdict, result.reason) = match outcome {
+        // The audio matches CTDB, but a FLAC MD5 doesn't match it.
+        Outcome::Verified => (
+            Verdict::Corrupted,
+            "FLAC MD5 mismatch (the audio matches CTDB)".into(),
+        ),
+        Outcome::Failed => {
+            result.recheck = true;
+            let why = msg.trim_start_matches("Repair check failed: ");
+            (Verdict::CannotCheck, format!("CTDB check failed: {why}"))
+        }
+        Outcome::Repairable | Outcome::Repaired | Outcome::NotRepairable => (
+            Verdict::RipErrors,
+            format!("Doesn't match CTDB; {}", outcome.verdict_note()),
+        ),
+    };
+    let damaged = analysis.and_then(|a| {
+        a.statuses.iter().find_map(|s| match s {
+            repair::EntryStatus::Repairable { tracks, .. } => Some(tracks),
+            _ => None,
+        })
+    });
+    for &n in damaged.into_iter().flatten() {
+        if let Some(t) = result.tracks.get_mut(n as usize - 1) {
+            t.status = TrackStatus::Mismatch;
+        }
+    }
 }
 
 /// The CTDB half of an album's check, looked up before AccurateRip's decode
@@ -1324,6 +1393,7 @@ mod tests {
             max_candidates: 4,
             use_ctdb: true,
             ctdb_first: false,
+            ctdb_only: false,
         };
         let job = AlbumJob {
             dir: PathBuf::new(),

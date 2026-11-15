@@ -319,6 +319,7 @@ mod tests {
             diagnosis: None,
             slip: None,
             ctdb_first: false,
+            ctdb_only: false,
             without_ctdb: false,
             offset_range: None,
         }

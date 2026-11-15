@@ -550,8 +550,7 @@ pub fn verify_with(
     };
     result.pressings = pressings.as_ref().map_or_default(|p| p.len());
 
-    for (k, (offset, crc, m)) in best.into_iter().enumerate() {
-        let t = &mut result.tracks[k];
+    let set = |t: &mut TrackResult, k: usize, (offset, crc, m): (i64, TrackCrc, Match)| {
         t.v1 = Some(crc.v1);
         t.v2 = Some(crc.v2);
         t.offset = offset;
@@ -568,6 +567,21 @@ pub fn verify_with(
         } else {
             TrackStatus::Mismatch
         };
+    };
+    for (k, b) in best.into_iter().enumerate() {
+        set(&mut result.tracks[k], k, b);
+    }
+    // Each track at its own best offset, which is what shows a sample slip.
+    let per_track = result.tracks.clone();
+    // A rip in one piece lines up with AccurateRip at one offset, so every
+    // track is judged at the offset most of them match at: a track that
+    // matches only somewhere else has gained or lost samples.
+    if let Some(p) = pressings.as_deref() {
+        let (o, c) = album_offset(&crcs, p);
+        for k in 0..n {
+            let m = find_match(k, &c[k], Some(p));
+            set(&mut result.tracks[k], k, (*o, c[k], m));
+        }
     }
 
     // Every offset each track is known to line up at: a disc can be in
@@ -657,7 +671,7 @@ pub fn verify_with(
         )
     };
     if matches!(result.verdict, Verdict::RipErrors | Verdict::Accurate)
-        && let Some((diagnosis, slip)) = sample_slip(&result.tracks, &matching)
+        && let Some((diagnosis, slip)) = sample_slip(&per_track, &matching)
     {
         result.diagnosis = Some(diagnosis);
         result.slip = slip;
@@ -724,6 +738,15 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
             !a.diagnosis
                 .as_deref()
                 .is_some_and(|d| d.contains("repair data can't fix"))
+        })
+        // Tracks judged at different offsets predate judging them all at one.
+        && albums.iter().all(|a| {
+            let mut offsets = a
+                .tracks
+                .iter()
+                .filter(|t| t.status != TrackStatus::AccurateCtdb && t.v1.is_some())
+                .map(|t| t.offset);
+            offsets.next().is_none_or(|o| offsets.all(|p| p == o))
         })
         // A check without CTDB skipped layout lookups and the repair check.
         && albums.iter().all(|a| !(a.without_ctdb && opts.use_ctdb))
@@ -1106,6 +1129,32 @@ fn shift_out_data_track(pressings: &[Pressing]) -> Vec<Pressing> {
                 .collect(),
         })
         .collect()
+}
+
+/// The checksums (of `crcs`, one per offset) that match `pressings` on the
+/// most tracks, then with the most confidence; the earliest on a tie.
+fn album_offset<'a>(
+    crcs: &'a [(i64, Vec<TrackCrc>)],
+    pressings: &[Pressing],
+) -> &'a (i64, Vec<TrackCrc>) {
+    let score = |c: &[TrackCrc]| {
+        let ms = c
+            .iter()
+            .enumerate()
+            .map(|(k, c)| find_match(k, c, Some(pressings)).confidence);
+        ms.fold((0, 0), |(n, sum), conf| {
+            (n + (conf > 0) as usize, sum + conf)
+        })
+    };
+    let mut best = &crcs[0];
+    let mut best_score = score(&best.1);
+    for e in &crcs[1..] {
+        let s = score(&e.1);
+        if s > best_score {
+            (best, best_score) = (e, s);
+        }
+    }
+    best
 }
 
 /// Accurate tracks before and after a run of bad tracks matching only at

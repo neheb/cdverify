@@ -82,6 +82,8 @@ pub struct App {
     pub cached: usize,
     pub hit: HitAreas,
     pub repairer: Option<Repairer>,
+    /// The databases checked against, in order, for the progress panel.
+    pub sources: &'static str,
     repairing: bool,
     /// The scanned library, and its folders seen so far: once all are in,
     /// cache entries for folders no longer there are dropped.
@@ -108,6 +110,7 @@ impl App {
             cached: 0,
             hit: HitAreas::default(),
             repairer: None,
+            sources: "AccurateRip",
             repairing: false,
             root: None,
             seen: Default::default(),

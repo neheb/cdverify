@@ -154,6 +154,12 @@ fn main() -> Result<std::process::ExitCode> {
 
     let mut app = App::new(cli.report.clone(), cli.skip_non_cd, cache, cache_path);
     app.repairer = repairer;
+    app.sources = match (cli.no_ctdb, cli.ctdb_only, ctdb_first) {
+        (true, _, _) => "AccurateRip",
+        (_, true, _) => "CTDB",
+        (_, _, true) => "CTDB + AccurateRip",
+        (_, _, false) => "AccurateRip + CTDB",
+    };
     app.root = Some(root);
     if cli.headless {
         run_headless(&mut app, rx)

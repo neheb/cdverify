@@ -97,7 +97,7 @@ fn tab_areas(titles: &[Line<'_>], area: Rect) -> Vec<Rect> {
 const ACTIVE_ROWS: usize = 4;
 
 fn draw_progress(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let block = Block::bordered().title(" AccurateRip ");
+    let block = Block::bordered().title(format!(" {} ", app.sources));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let rows = Layout::vertical([Constraint::Length(1); 1 + ACTIVE_ROWS]).split(inner);
@@ -325,12 +325,15 @@ mod tests {
                 std::path::PathBuf::new(),
             );
             app.total = Some(10);
+            app.sources = "CTDB + AccurateRip";
             for (w, n) in names.iter().enumerate() {
                 app.active.insert(w, (n.to_string(), 0.5));
             }
             let mut term = ratatui::Terminal::new(TestBackend::new(40, 7)).unwrap();
             term.draw(|f| draw_progress(f, &app, f.area())).unwrap();
             let buf = term.backend().buffer().clone();
+            let title: String = (0..40).map(|x| buf[(x, 0)].symbol()).collect();
+            assert!(title.contains(" CTDB + AccurateRip "), "{title}");
             (2..2 + ACTIVE_ROWS as u16)
                 .map(|y| {
                     (1..39)

@@ -631,7 +631,7 @@ pub fn verify_with(
             ),
         )
     };
-    if result.verdict == Verdict::RipErrors
+    if matches!(result.verdict, Verdict::RipErrors | Verdict::Accurate)
         && let Some((diagnosis, slip)) = sample_slip(&result.tracks, &matching)
     {
         result.diagnosis = Some(diagnosis);
@@ -643,7 +643,7 @@ pub fn verify_with(
         real_layout,
     );
     result.ctdb_toc = Some(toc.clone());
-    if result.verdict == Verdict::RipErrors && opts.use_ctdb {
+    if (result.verdict == Verdict::RipErrors || result.slip.is_some()) && opts.use_ctdb {
         let note = match db::ctdb_repair_info(db, &toc) {
             Ok(Some((conf, parity))) => {
                 result.ctdb_known = true;
@@ -816,7 +816,13 @@ pub fn verify_ctdb_first(
             ar.recheck = true;
         }
         match ar.verdict {
-            Verdict::Accurate => ar.reason.push_str("; differs from CTDB"),
+            Verdict::Accurate => {
+                ar.reason.push_str("; differs from CTDB");
+                // A slip between tracks, which CTDB can tell about.
+                if ar.slip.is_some() {
+                    ar.reason = format!("{}, {}", ar.reason, outcome.verdict_note());
+                }
+            }
             Verdict::RipErrors => {
                 ar.reason = format!("{}; {}", ar.reason, outcome.verdict_note());
             }
@@ -1017,10 +1023,11 @@ fn shift_out_data_track(pressings: &[Pressing]) -> Vec<Pressing> {
 
 /// Accurate tracks before and after a run of bad tracks matching only at
 /// different offsets (`matching[k]` being every offset track `k` matches
-/// at) means the bad tracks gained or lost samples: the drive
-/// lost sync. As ripped that's beyond CTDB's parity; realigned it may not be
-/// (see [`crate::slip`]). Returns the diagnosis and, if there's one slip,
-/// the slip.
+/// at) means the bad tracks gained or lost samples: the drive lost sync. As
+/// ripped that's beyond CTDB's parity; realigned it may not be (see
+/// [`crate::slip`]). Two accurate tracks in a row doing so means it lost
+/// sync where they meet (or in silence there), which AccurateRip can't see
+/// but CTDB can. Returns the diagnosis and, if there's one slip, the slip.
 fn sample_slip(tracks: &[TrackResult], matching: &[Vec<i64>]) -> Option<(String, Option<Slip>)> {
     let accurate = |t: &TrackResult| t.status == TrackStatus::Accurate;
     let mut notes = Vec::new();
@@ -1029,6 +1036,31 @@ fn sample_slip(tracks: &[TrackResult], matching: &[Vec<i64>]) -> Option<(String,
     let mut bad: Vec<u32> = Vec::new();
     for (k, t) in tracks.iter().enumerate() {
         if accurate(t) {
+            if let Some((prev_k, prev)) = last_good
+                && prev.offset != t.offset
+                && bad.is_empty()
+                && prev_k + 1 == k
+                && !matching[prev_k].iter().any(|o| matching[k].contains(o))
+            {
+                let shift = t.offset - prev.offset;
+                notes.push(format!(
+                    "the drive {} {} samples between tracks {} and {} (track {} matches at \
+                     offset {:+}, track {} at {:+}): both are accurate, but they don't join up",
+                    if shift < 0 { "dropped" } else { "repeated" },
+                    shift.abs(),
+                    prev.number,
+                    t.number,
+                    prev.number,
+                    prev.offset,
+                    t.number,
+                    t.offset,
+                ));
+                slips.push(Slip {
+                    first: k,
+                    last: prev_k,
+                    shift,
+                });
+            }
             if let Some((prev_k, prev)) = last_good
                 && prev.offset != t.offset
                 && !bad.is_empty()
@@ -1262,6 +1294,25 @@ mod tests {
         // +42 too: the rip is in one piece.
         let both = vec![vec![48, 42], vec![], vec![42]];
         assert_eq!(sample_slip(&slip, &both), None);
+        // Two accurate tracks that don't join up.
+        let boundary = [
+            track(1, 48, Accurate),
+            track(2, 48, Accurate),
+            track(3, 42, Accurate),
+        ];
+        let (d, s) = sample_slip(&boundary, &best_only(&boundary)).unwrap();
+        assert!(
+            d.contains("dropped 6 samples between tracks 2 and 3"),
+            "{d}"
+        );
+        assert_eq!(
+            s,
+            Some(Slip {
+                first: 2,
+                last: 1,
+                shift: -6
+            })
+        );
     }
 
     #[test]

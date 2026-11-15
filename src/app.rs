@@ -330,7 +330,7 @@ impl App {
                 return;
             }
             // Only an album that CTDB itself flagged gets checked again.
-            None if album.verdict == Verdict::Accurate => {
+            None if album.verdict == Verdict::Accurate && album.slip.is_none() => {
                 self.message = Some("This rip is accurate; there's nothing to repair".into());
                 return;
             }

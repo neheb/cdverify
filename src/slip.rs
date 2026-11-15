@@ -38,7 +38,8 @@ use crate::scan::AlbumJob;
 
 /// A sample slip, as AccurateRip shows it: tracks `first..=last` (indices)
 /// don't match, and the accurate tracks around them match at offsets
-/// `shift` frames apart.
+/// `shift` frames apart. With `last + 1 == first`, no track is bad: the slip
+/// is where track `first - 1` meets track `first`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Slip {
     pub first: usize,
@@ -354,23 +355,30 @@ fn attempt(
     progress: &mut dyn FnMut(f32),
 ) -> Result<(Outcome, String)> {
     let n = job.tracks.len();
-    if slip.first > slip.last || slip.last >= n || slip.shift == 0 {
+    if slip.first == 0 || slip.first > slip.last + 1 || slip.last >= n || slip.shift == 0 {
         bail!("no sample slip to repair");
     }
     let bounds = repair::track_bounds(job)?;
     let total = bounds[n];
     let number = |k: usize| job.tracks[k].number.unwrap_or(k as u32 + 1);
-    let bad = (slip.first..=slip.last)
-        .map(|k| number(k).to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    // The tracks to re-rip: those that don't match, or both sides of a
+    // slip between tracks.
+    let bad: Vec<usize> = match slip.first > slip.last {
+        true => vec![slip.last, slip.first],
+        false => (slip.first..=slip.last).collect(),
+    };
+    let rerip = format!(
+        "re-rip track{} {}",
+        plural(bad.len()),
+        bad.iter()
+            .map(|&k| number(k).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let not = |why: &str| {
         Ok((
             Outcome::NotRepairable,
-            format!(
-                "Not repairable: {why}; re-rip track{} {bad}",
-                plural(slip.last - slip.first + 1)
-            ),
+            format!("Not repairable: {why}; {rerip}"),
         ))
     };
     let mut entries: Vec<_> = db::ctdb_exact(db, toc)
@@ -426,6 +434,12 @@ fn attempt(
     // Where the slip is, and what it did.
     let k = bounds.partition_point(|&b| b <= at).clamp(1, n) - 1;
     let secs = (at - bounds[k]) / (SECTOR_FRAMES * 75);
+    let place = match (k, secs) {
+        (1.., 0) if at == bounds[k] => {
+            format!("between tracks {} and {}", number(k - 1), number(k))
+        }
+        _ => format!("in track {} at {}:{:02}", number(k), secs / 60, secs % 60),
+    };
     let what = match slip.shift < 0 {
         true => "dropped",
         false => "repeated",
@@ -445,12 +459,9 @@ fn attempt(
         .collect::<Vec<_>>()
         .join(", ");
     let summary = format!(
-        "Repairable: the drive {what} {} samples in track {} at {}:{:02}; realigning \
+        "Repairable: the drive {what} {} samples {place}; realigning \
          track{} {list} and correcting {} samples matches CTDB (confidence {confidence})",
         slip.shift.abs(),
-        number(k),
-        secs / 60,
-        secs % 60,
         plural(tracks.len()),
         fixes.len(),
     );

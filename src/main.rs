@@ -173,9 +173,9 @@ struct RepairOptions {
 /// Whether --ar-first mode checks this album against CTDB's parity data.
 fn wants_repair(album: &verify::AlbumResult, ro: &RepairOptions) -> bool {
     ro.check_all
-        || (album.verdict == verify::Verdict::RipErrors
-            && album.ctdb_known
-            && (album.diagnosis.is_none() || album.slip.is_some()))
+        || (album.ctdb_known
+            && (album.slip.is_some()
+                || (album.verdict == verify::Verdict::RipErrors && album.diagnosis.is_none())))
 }
 
 /// Undoes [`maybe_repair`] on a cached result, so it can be reused as the
@@ -228,7 +228,7 @@ fn maybe_repair(
             .map(|o| repair::destination(o, root, &job.dir));
         let (outcome, msg) = known
             .unwrap_or_else(|| repair::run(job, &toc, db, album.slip, dest.as_deref(), progress));
-        if album.verdict == verify::Verdict::RipErrors {
+        if album.verdict == verify::Verdict::RipErrors || album.slip.is_some() {
             album.reason = format!("{}; {}", album.reason, outcome.verdict_note());
         }
         if let Some(recheck) = outcome.recheck() {

@@ -321,6 +321,7 @@ mod tests {
             ctdb_first: false,
             ctdb_only: false,
             without_ctdb: false,
+            ar_unknown: false,
             offset_range: None,
         }
     }

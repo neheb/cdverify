@@ -68,8 +68,8 @@ struct Cli {
     /// CDs that AccurateRip doesn't know by their audio tracks alone.
     #[arg(long)]
     no_ctdb: bool,
-    /// Use AccurateRip as the primary source, consulting CTDB only for
-    /// layout lookups and repair data. By default CTDB comes first: albums
+    /// Use AccurateRip as the primary source: CTDB decides only albums
+    /// AccurateRip doesn't know. By default CTDB comes first: albums
     /// matching CTDB's parity data are accurate, and only those that don't
     /// are checked against AccurateRip.
     #[arg(long, conflicts_with = "ctdb_only")]
@@ -305,13 +305,14 @@ fn check_album(
     // (being this run's) it may write repaired copies.
     let (normal, inverted) = match (other, opts.ctdb_first) {
         (Some(normal), true) => {
-            let ar = without_repair(&normal);
+            // A result from CTDB has no AccurateRip check in it to reuse.
+            let ar = (!normal.ar_unknown).then(|| without_repair(&normal));
             let inverted = verify::verify_ctdb_first(
                 job,
                 db,
                 opts,
                 dest.as_deref(),
-                Some(&ar),
+                ar.as_ref(),
                 None,
                 progress,
             )
@@ -325,10 +326,42 @@ fn check_album(
         }
         (None, _) => check_both(job, root, db, opts, dest.as_deref(), ro, progress),
     };
+    let normal = ar_fallback(normal, &inverted);
     match opts.ctdb_first {
         true => (inverted, Some(normal)),
         false => (normal, Some(inverted)),
     }
+}
+
+/// The --ar-first result for an album AccurateRip doesn't know (or couldn't
+/// be asked about): CTDB's, from the CTDB-first check (`inverted`), as
+/// CTDB-first mode falls back to AccurateRip. The two modes differ only in
+/// which database decides an album both know.
+fn ar_fallback(normal: verify::AlbumResult, inverted: &verify::AlbumResult) -> verify::AlbumResult {
+    use verify::Verdict;
+    let unknown = normal.verdict == Verdict::NotFound
+        || (normal.verdict == Verdict::CannotCheck
+            && normal.reason.starts_with(verify::AR_LOOKUP_FAILED));
+    if !unknown || matches!(inverted.verdict, Verdict::NotFound | Verdict::CannotCheck) {
+        return normal;
+    }
+    let mut album = inverted.clone();
+    album.ctdb_first = false;
+    album.ar_unknown = true;
+    album.cached = false;
+    // The verdict says what CTDB found; say what AccurateRip did.
+    if !album.reason.contains("AccurateRip") {
+        let mut ar = normal.reason.chars();
+        let ar: String = ar
+            .next()
+            .map(|c| c.to_lowercase().chain(ar).collect())
+            .unwrap_or_default();
+        album.reason = format!("{}; {ar}", album.reason);
+    }
+    // A failed lookup is worth retrying; an album AccurateRip doesn't know
+    // gets its verdict from CTDB, which settles it like CTDB-first mode does.
+    album.recheck |= normal.verdict == Verdict::CannotCheck;
+    album
 }
 
 /// Both modes' results for an album, from one AccurateRip and one CTDB check.

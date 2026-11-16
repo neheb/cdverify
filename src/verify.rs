@@ -174,6 +174,10 @@ pub struct AlbumResult {
     /// check, which a run with CTDB has to make up for.
     #[serde(default)]
     pub without_ctdb: bool,
+    /// An `--ar-first` result that is CTDB's, as AccurateRip doesn't know
+    /// the album (or couldn't be asked): no AccurateRip check to reuse.
+    #[serde(default)]
+    pub ar_unknown: bool,
     /// `--offset-range` of a check that decoded the album (`None` for older
     /// cache entries and albums that weren't decoded).
     #[serde(default)]
@@ -263,6 +267,7 @@ fn blank_result(job: &AlbumJob) -> AlbumResult {
         ctdb_first: false,
         ctdb_only: false,
         without_ctdb: false,
+        ar_unknown: false,
         offset_range: None,
         tracks: job
             .tracks
@@ -655,10 +660,7 @@ pub fn verify_with(
             format!("{} of {n} tracks corrupted", count(TrackStatus::Corrupted)),
         )
     } else if let (None, Err(e)) = (&pressings, &lookup) {
-        (
-            Verdict::CannotCheck,
-            format!("AccurateRip lookup failed: {e}"),
-        )
+        (Verdict::CannotCheck, format!("{AR_LOOKUP_FAILED}: {e}"))
     } else if pressings.as_ref().is_none_or(|p| p.is_empty()) {
         (Verdict::NotFound, "Not in AccurateRip database".into())
     } else if count(TrackStatus::Mismatch) > 0 {
@@ -732,6 +734,7 @@ pub fn verify_with(
 }
 
 const CTDB_LOOKUP_FAILED: &str = "CTDB lookup failed";
+pub const AR_LOOKUP_FAILED: &str = "AccurateRip lookup failed";
 /// Note on an album AccurateRip finds errors in, but that matches a CTDB
 /// entry too weak to trust (followed by its confidence).
 const WEAK_CTDB_MATCH: &str =

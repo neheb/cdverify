@@ -89,25 +89,24 @@ pub struct Analysis {
     /// The most confident repair, if any.
     plan: Option<(u32, i64, Vec<Fix>)>,
     bounds: Arc<[u64]>,
+    /// Exact matches below this confidence don't count when a more
+    /// confident entry can be repaired to: they may be this rip's own
+    /// submission (see [`Analysis::distrust_below`]).
+    distrust_below: u32,
 }
 
 impl Analysis {
     pub fn summary(&self) -> String {
-        if let Some(EntryStatus::Verified { confidence, offset }) = self
-            .statuses
-            .iter()
-            .find(|s| matches!(s, EntryStatus::Verified { .. }))
-        {
+        if let Some((confidence, offset)) = self.verified() {
             return format!(
                 "Matches CTDB exactly (confidence {confidence}, offset {offset:+}): the rip is \
                  correct for that version of the disc, so there's nothing to repair"
             );
         }
-        match self
-            .statuses
-            .iter()
-            .find(|s| matches!(s, EntryStatus::Repairable { .. }))
-        {
+        let planned = self.plan.as_ref().map(|p| p.0);
+        match self.statuses.iter().find(|s| {
+            matches!(s, EntryStatus::Repairable { confidence, .. } if Some(*confidence) == planned)
+        }) {
             Some(EntryStatus::Repairable {
                 confidence,
                 samples,
@@ -141,12 +140,29 @@ impl Analysis {
         }
     }
 
-    /// Confidence and offset of the CTDB entry the rip matches exactly.
+    /// Confidence and offset of the CTDB entry the rip matches exactly. A
+    /// rip matching one entry is that version of the disc: "repairing" it
+    /// toward another entry would rewrite correct audio. Unless the match is
+    /// below [`Analysis::distrust_below`] and a more confident entry is
+    /// repairable.
     pub fn verified(&self) -> Option<(u32, i64)> {
-        self.statuses.iter().find_map(|s| match s {
-            EntryStatus::Verified { confidence, offset } => Some((*confidence, *offset)),
-            _ => None,
-        })
+        self.statuses
+            .iter()
+            .filter_map(|s| match s {
+                EntryStatus::Verified { confidence, offset } => Some((*confidence, *offset)),
+                _ => None,
+            })
+            .max_by_key(|v| v.0)
+            .filter(|&(conf, _)| {
+                conf >= self.distrust_below || self.plan.as_ref().is_none_or(|p| p.0 <= conf)
+            })
+    }
+
+    /// Stops an exact match below confidence `conf` from ruling out a repair
+    /// toward a more confident entry: for when AccurateRip says the rip has
+    /// errors, so a weak entry it matches is probably its own submission.
+    pub fn distrust_below(&mut self, conf: u32) {
+        self.distrust_below = conf;
     }
 
     /// The corrections that make the rip match CTDB: none if it already
@@ -163,15 +179,11 @@ impl Analysis {
     }
 
     pub fn repairable(&self) -> bool {
-        self.plan.is_some()
+        self.verified().is_none() && self.plan.is_some()
     }
 
     pub fn outcome(&self) -> Outcome {
-        if self
-            .statuses
-            .iter()
-            .any(|s| matches!(s, EntryStatus::Verified { .. }))
-        {
+        if self.verified().is_some() {
             Outcome::Verified
         } else if self.repairable() {
             Outcome::Repairable
@@ -388,19 +400,13 @@ impl Pass {
                 }
             }
         }
-        // A rip that exactly matches one entry is that version of the disc;
-        // "repairing" it toward another entry would rewrite correct audio.
-        if statuses
-            .iter()
-            .any(|s| matches!(s, EntryStatus::Verified { .. }))
-        {
-            plan = None;
-        }
+        // An exact match rules the plan out: see `Analysis::verified`.
         Ok(Analysis {
             statuses,
             md5_mismatch: false,
             plan,
             bounds,
+            distrust_below: 0,
         })
     }
 }
@@ -458,6 +464,8 @@ pub fn affected_tracks(bounds: &[u64], fixes: &[Fix]) -> Vec<u32> {
 /// Checks the album against CTDB's parity and, if it's repairable and `dest`
 /// is given, writes corrected copies of the affected tracks there. Returns
 /// the outcome and a one-line description.
+/// An exact match below `distrust_below` doesn't stop a repair toward a more
+/// confident entry (see [`Analysis::distrust_below`]).
 /// With `slip`, a sample slip AccurateRip found, the album is realigned
 /// first (see [`slip`](crate::slip)).
 pub fn run(
@@ -466,13 +474,17 @@ pub fn run(
     db: &Db,
     slip: Option<Slip>,
     dest: Option<&Path>,
+    distrust_below: u32,
     progress: &mut dyn FnMut(f32),
 ) -> (Outcome, String) {
     if let Some(slip) = slip {
         return crate::slip::run(job, toc, db, slip, dest, progress);
     }
     match analyze(job, toc, db, progress) {
-        Ok(a) => finish(job, &a, dest),
+        Ok(mut a) => {
+            a.distrust_below(distrust_below);
+            finish(job, &a, dest)
+        }
         Err(e) => failed(&e),
     }
 }
@@ -532,10 +544,10 @@ pub fn write_repaired(
     out_dir: &Path,
     progress: &mut dyn FnMut(f32),
 ) -> Result<(Vec<PathBuf>, &'static str)> {
-    let (_, _, fixes) = analysis
-        .plan
-        .as_ref()
-        .ok_or_else(|| anyhow!("nothing to repair"))?;
+    let fixes = match analysis.fix_plan() {
+        Some((_, _, fixes)) if !fixes.is_empty() => fixes,
+        _ => bail!("nothing to repair"),
+    };
     let bounds = &analysis.bounds;
     let tracks = affected_tracks(bounds, fixes);
     prepare_out_dir(job, out_dir)?;

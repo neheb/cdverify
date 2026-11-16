@@ -743,7 +743,7 @@ const AR_CANNOT_CONFIRM: &str = "AccurateRip can't confirm it";
 /// CTDB matches below this confidence are checked with AccurateRip: one
 /// submission may be the rip's own. Like AccurateRip's `--min-confidence`,
 /// but never below 2.
-fn weak_ctdb_below(opts: &Options) -> u32 {
+pub fn weak_ctdb_below(opts: &Options) -> u32 {
     opts.min_confidence.max(2)
 }
 
@@ -898,7 +898,7 @@ pub fn verify_ctdb_first(
         }
     };
     let toc = ctdb_toc(&sectors, layout);
-    let analysis = match (prep.pass, prep.notes) {
+    let mut analysis = match (prep.pass, prep.notes) {
         (Some(Ok(pass)), Some(notes)) => pass.finish(&notes, db),
         (Some(Err(e)), _) => Err(e),
         _ => repair::analyze(job, &toc, db, &mut |f| progress(Stage::Check, f)),
@@ -981,14 +981,31 @@ pub fn verify_ctdb_first(
             ar.reason = format!("{}; {WEAK_CTDB_MATCH} {confidence}", ar.reason);
             ar.ctdb_known = true;
             ar.ctdb_toc = Some(toc);
-            ar.repair_outcome = Some(Outcome::Verified);
-            let msg = format!(
-                "Matches a CTDB entry with confidence {confidence} exactly, but AccurateRip \
-                 disagrees: that entry is probably this rip's own submission, not a \
-                 confirmation"
-            );
+            // So a more confident entry can be repaired to.
+            let (outcome, msg) = match analysis.as_mut() {
+                Ok(a) if ar.verdict == Verdict::RipErrors => {
+                    a.distrust_below(weak_ctdb_below(opts));
+                    repair::finish(job, a, dest)
+                }
+                _ => (Outcome::Verified, String::new()),
+            };
+            let msg = match outcome {
+                Outcome::Verified => format!(
+                    "Matches a CTDB entry with confidence {confidence} exactly, but \
+                     AccurateRip disagrees: that entry is probably this rip's own \
+                     submission, not a confirmation"
+                ),
+                _ => {
+                    ar.reason = format!("{}; {}", ar.reason, outcome.verdict_note());
+                    msg
+                }
+            };
+            ar.repair_outcome = Some(outcome);
+            if let Some(recheck) = outcome.recheck().filter(|_| outcome != Outcome::Verified) {
+                ar.recheck = recheck;
+            }
             ar.repair = Some(msg.clone());
-            return (ar, Some((Outcome::Verified, msg)));
+            return (ar, Some((outcome, msg)));
         }
     }
 

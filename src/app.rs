@@ -62,6 +62,9 @@ pub struct Repairer {
     pub root: PathBuf,
     /// `None` without `--repair` and a home folder for the default.
     pub out: Option<PathBuf>,
+    /// CTDB matches below this confidence don't stop a repair of an album
+    /// AccurateRip finds errors in.
+    pub weak_below: u32,
 }
 
 /// A folder being checked.
@@ -371,6 +374,10 @@ impl App {
         };
         let (dir, title) = (album.dir.clone(), album.title.clone());
         let slip = album.slip;
+        let distrust = match album.verdict {
+            Verdict::RipErrors => r.weak_below,
+            _ => 0,
+        };
         let paths: Vec<PathBuf> = album.tracks.iter().map(|t| t.path.clone()).collect();
         let (tx, db) = (r.tx.clone(), r.db.clone());
         let Some(out) = &r.out else {
@@ -406,7 +413,7 @@ impl App {
                         });
                     }
                 };
-                crate::repair::run(&job, &toc, &db, slip, Some(&dest), &mut progress)
+                crate::repair::run(&job, &toc, &db, slip, Some(&dest), distrust, &mut progress)
             }))
             .unwrap_or_else(|_| {
                 (

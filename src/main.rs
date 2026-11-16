@@ -123,6 +123,7 @@ fn main() -> Result<std::process::ExitCode> {
     let repair_opts = RepairOptions {
         out: cli.repair.clone(),
         check_all: cli.ctdb_check,
+        weak_below: verify::weak_ctdb_below(&opts),
     };
     let (tx, rx) = mpsc::channel();
     // Canonicalize so cache keys don't depend on how the path was typed.
@@ -136,6 +137,7 @@ fn main() -> Result<std::process::ExitCode> {
         db: db.clone(),
         root: root.clone(),
         out: cli.repair.clone().or_else(repair::default_out),
+        weak_below: repair_opts.weak_below,
     });
     // Work out both modes' results (CTDB first and --ar-first) so a later run in
     // either mode comes from the cache; without CTDB there's only one.
@@ -181,6 +183,9 @@ fn main() -> Result<std::process::ExitCode> {
 struct RepairOptions {
     out: Option<PathBuf>,
     check_all: bool,
+    /// CTDB matches below this confidence don't stop a repair of an album
+    /// AccurateRip finds errors in.
+    weak_below: u32,
 }
 
 /// Whether --ar-first mode checks this album against CTDB's parity data.
@@ -240,9 +245,19 @@ fn maybe_repair(
             .filter(|_| write)
             .map(|o| repair::destination(o, root, &job.dir));
         let (outcome, msg) = known.unwrap_or_else(|| {
-            repair::run(job, &toc, db, album.slip, dest.as_deref(), &mut |f| {
-                progress(verify::Stage::Repair, f)
-            })
+            let distrust = match album.verdict {
+                verify::Verdict::RipErrors => ro.weak_below,
+                _ => 0,
+            };
+            repair::run(
+                job,
+                &toc,
+                db,
+                album.slip,
+                dest.as_deref(),
+                distrust,
+                &mut |f| progress(verify::Stage::Repair, f),
+            )
         });
         if album.verdict == verify::Verdict::RipErrors || album.slip.is_some() {
             album.reason = format!("{}; {}", album.reason, outcome.verdict_note());

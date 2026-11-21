@@ -89,6 +89,10 @@ pub struct Analysis {
     /// The most confident repair, if any.
     plan: Option<(u32, i64, Vec<Fix>)>,
     bounds: Arc<[u64]>,
+    /// CRC32 of the audio as checked up to each of `bounds` (see
+    /// [`Analysis::range_crc`]), so a file that changes before it's
+    /// repaired is caught.
+    bound_crcs: Vec<u32>,
     /// Exact matches below this confidence don't count when a more
     /// confident entry can be repaired to: they may be this rip's own
     /// submission (see [`Analysis::distrust_below`]).
@@ -178,8 +182,24 @@ impl Analysis {
         }
     }
 
+    /// The tracks (numbered from 1) the repair in [`Analysis::fix_plan`]
+    /// changes.
+    pub fn plan_tracks(&self) -> Vec<u32> {
+        self.fix_plan()
+            .map(|(_, _, fixes)| affected_tracks(&self.bounds, fixes))
+            .unwrap_or_default()
+    }
+
     pub fn repairable(&self) -> bool {
         self.verified().is_none() && self.plan.is_some()
+    }
+
+    /// CRC32 of the audio checked for tracks `first..last` (indices into
+    /// the album's tracks), if the whole range was fed.
+    fn range_crc(&self, first: usize, last: usize) -> Option<u32> {
+        let (a, b) = (*self.bound_crcs.get(first)?, *self.bound_crcs.get(last)?);
+        let len = self.bounds[last].checked_sub(self.bounds[first])?;
+        Some(b ^ crc32_shift(a, len * 4))
     }
 
     pub fn outcome(&self) -> Outcome {
@@ -229,15 +249,35 @@ pub struct Pass {
     pos: u64,
     samples: u64,
     bounds: Arc<[u64]>,
+    /// The prefix CRCs at the `bounds` passed so far.
+    bound_crcs: Vec<u32>,
 }
 
 impl Pass {
     /// Looks up CTDB's entries for `toc`, ready to be fed the album.
     pub fn new(job: &AlbumJob, toc: &str, db: &Db) -> Result<Pass> {
+        Pass::with_stride(job, toc, db, None)
+    }
+
+    /// [`Pass::new`] for the entries with parity stride `stride_frames`, if
+    /// given, rather than the first entry's that gives one.
+    pub fn with_stride(
+        job: &AlbumJob,
+        toc: &str,
+        db: &Db,
+        stride_frames: Option<usize>,
+    ) -> Result<Pass> {
         let bounds = track_bounds(job)?;
-        let samples = bounds.last().copied().unwrap_or(0);
         let entries = db::ctdb_exact(db, toc).context("CTDB lookup")?;
-        let stride_frames = entries.iter().find_map(|e| e.stride).unwrap_or(OLD_STRIDE);
+        let stride_frames = stride_frames
+            .unwrap_or_else(|| entries.iter().find_map(|e| e.stride).unwrap_or(OLD_STRIDE));
+        Ok(Pass::from_entries(bounds, entries, stride_frames))
+    }
+
+    /// A pass over an album with track `bounds`, checking `entries` with
+    /// parity stride `stride_frames`.
+    fn from_entries(bounds: Arc<[u64]>, entries: Vec<CtdbEntry>, stride_frames: usize) -> Pass {
+        let samples = bounds.last().copied().unwrap_or(0);
         let geo = Geometry::new(samples, stride_frames * 2);
         let reach = stride_frames as u64;
         let (a0, b0) = parity::crc_window(geo, 0);
@@ -251,7 +291,7 @@ impl Pass {
                 crcs: Vec::new(),
             },
         ];
-        Ok(Pass {
+        Pass {
             entries,
             stride_frames,
             geo,
@@ -262,7 +302,8 @@ impl Pass {
             pos: 0,
             samples,
             bounds,
-        })
+            bound_crcs: Vec::new(),
+        }
     }
 
     /// Feeds the album's next frames, in order from its first.
@@ -270,6 +311,7 @@ impl Pass {
         self.enc.push(frames);
         for &f in frames {
             self.mark();
+            self.mark_bound();
             self.crc.update_frame(f);
             self.pos += 1;
         }
@@ -285,6 +327,13 @@ impl Pass {
         }
     }
 
+    /// Records the CRC of the prefix ending here at each track boundary.
+    fn mark_bound(&mut self) {
+        while self.bounds.get(self.bound_crcs.len()) == Some(&self.pos) {
+            self.bound_crcs.push(self.crc.value());
+        }
+    }
+
     /// Checks the fed album against each entry, given the decode's notes on
     /// damaged tracks. An MD5 mismatch alone doesn't stop the check: the
     /// audio still decoded in full.
@@ -297,6 +346,7 @@ impl Pass {
             bail!("track {}: {note}", k + 1);
         }
         self.mark();
+        self.mark_bound();
         let mut analysis = self.check(db)?;
         analysis.md5_mismatch = notes.iter().any(Option::is_some);
         Ok(analysis)
@@ -310,6 +360,7 @@ impl Pass {
             windows,
             enc,
             bounds,
+            bound_crcs,
             ..
         } = self;
         let prefix = |p: u64| -> Option<u32> {
@@ -406,6 +457,7 @@ impl Pass {
             md5_mismatch: false,
             plan,
             bounds,
+            bound_crcs,
             distrust_below: 0,
         })
     }
@@ -579,6 +631,13 @@ pub fn write_repaired(
                 "{} decoded to a different length than when it was checked",
                 track.path.display()
             );
+        }
+        let mut crc = Crc32::new();
+        for &[l, r] in pcm[(skip * 2) as usize..].as_chunks::<2>().0 {
+            crc.update_frame(l as u16 as u32 | (r as u16 as u32) << 16);
+        }
+        if analysis.range_crc(first, last) != Some(crc.value()) {
+            bail!("{} changed since it was checked", track.path.display());
         }
         let first_word = (start * 2) as usize;
         for f in fixes
@@ -775,6 +834,57 @@ mod tests {
         let mut c = Crc32::new();
         c.update(bytes);
         c.value()
+    }
+
+    /// A 16-bit stereo 44.1 kHz WAV file of `pcm`.
+    fn wav(path: &Path, pcm: &[i16]) {
+        let data = (pcm.len() * 2) as u32;
+        let mut out = b"RIFF".to_vec();
+        out.extend((36 + data).to_le_bytes());
+        out.extend(b"WAVEfmt ");
+        for v in [16u32, 0x0002_0001, 44100, 44100 * 4, 0x0010_0004] {
+            out.extend(v.to_le_bytes());
+        }
+        out.extend(b"data");
+        out.extend(data.to_le_bytes());
+        out.extend(pcm.iter().flat_map(|s| s.to_le_bytes()));
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_repair_a_changed_file() {
+        let dir = std::env::temp_dir().join(format!("cdverify-repair-crc-{}", std::process::id()));
+        let out = dir.join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracks: Vec<PathBuf> = (1..=2).map(|n| dir.join(format!("{n:02}.wav"))).collect();
+        let len = SECTOR_FRAMES as usize * 4 * 2;
+        for (n, path) in tracks.iter().enumerate() {
+            let pcm: Vec<i16> = (0..len).map(|i| (i * 31 + n * 7) as i16).collect();
+            wav(path, &pcm);
+        }
+        let job = AlbumJob {
+            dir: dir.clone(),
+            title: String::new(),
+            tracks: tracks.iter().map(|p| crate::scan::probe_track(p)).collect(),
+        };
+        let mut pass = Pass::from_entries(track_bounds(&job).unwrap(), Vec::new(), OLD_STRIDE);
+        let notes = decode::decode_album(&job.tracks, false, |_, f| pass.push(f));
+        let mut analysis = pass.finish(&notes, &Db::new()).unwrap();
+        // A fix in track 2.
+        let word = (analysis.bounds[1] * 2 + 5) as usize;
+        analysis.plan = Some((2, 0, vec![Fix { word, diff: 1 }]));
+        let (written, _) = write_repaired(&job, &analysis, &out, &mut |_| {}).unwrap();
+        assert_eq!(written, [out.join("02.wav")]);
+
+        // Same length, different audio.
+        let pcm: Vec<i16> = (0..len).map(|i| (i * 31 + 8) as i16).collect();
+        wav(&tracks[1], &pcm);
+        let err = write_repaired(&job, &analysis, &out, &mut |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("changed since it was checked"),
+            "{err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

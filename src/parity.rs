@@ -720,6 +720,12 @@ pub fn find_offset(enc: &ParityEncoder, db_syn: &[u16]) -> Option<(i64, bool)> {
         if syn.iter().all(|&s| s == 0) {
             return Some((offset, true));
         }
+        // Fewer than `npar / 2` errors, though `npar / 2` are correctable:
+        // a wrong offset's syndrome is noise, whose locator almost always
+        // has degree `npar / 2`, and with roots at valid positions often
+        // enough (roughly `(stridecount / 65535)^(npar/2) / (npar/2)!`)
+        // that some of the ~`stride` offsets tried would pass. One error
+        // fewer leaves a word of redundancy to rule those out.
         if let Some(n) = calc_sigma(g, npar, &mut sigma, &syn)
             && n > 0
             && n < best.map_or(npar / 2, |b| b.1)

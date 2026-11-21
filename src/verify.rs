@@ -759,7 +759,10 @@ fn unchecked_weak_ctdb(a: &AlbumResult, opts: &Options) -> bool {
         .and_then(|c| c.parse::<u32>().ok())
         .is_some_and(|c| c < weak_ctdb_below(opts))
         && !a.reason.contains(AR_CONFIRMS)
-        && !a.reason.contains(AR_CANNOT_CONFIRM)
+        && (!a.reason.contains(AR_CANNOT_CONFIRM)
+            // Cached by versions that didn't retry a failed lookup.
+            || a.reason
+                .contains(&format!("{AR_CANNOT_CONFIRM}: {AR_LOOKUP_FAILED}")))
 }
 const UNKNOWN_LENGTH: &str = "Unknown track length";
 const NOT_IN_CTDB: &str = "; not in CTDB";
@@ -807,6 +810,9 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
         && albums.iter().all(|a| !unchecked_weak_ctdb(a, opts))
         // A check without CTDB skipped layout lookups and the repair check.
         && albums.iter().all(|a| !(a.without_ctdb && opts.use_ctdb))
+        // And one with it may have let CTDB decide an album AccurateRip
+        // doesn't know.
+        && albums.iter().all(|a| !(a.ar_unknown && !opts.use_ctdb))
         && albums
             .iter()
             .all(|a| a.offset_range.is_none_or(|r| r == opts.offset_range))
@@ -980,6 +986,8 @@ pub fn verify_ctdb_first(
             Verdict::Accurate => format!("; {AR_CONFIRMS}"),
             _ => format!("; {AR_CANNOT_CONFIRM}: {}", ar.reason),
         };
+        // A failed lookup decides nothing: ask AccurateRip again next run.
+        result.recheck = ar.verdict == Verdict::CannotCheck;
         if matches!(ar.verdict, Verdict::RipErrors | Verdict::Corrupted) {
             ar.reason = format!("{}; {WEAK_CTDB_MATCH} {confidence}", ar.reason);
             ar.ctdb_known = true;
@@ -1059,13 +1067,8 @@ fn ctdb_only_verdict(
             format!("Doesn't match CTDB; {}", outcome.verdict_note()),
         ),
     };
-    let damaged = analysis.and_then(|a| {
-        a.statuses.iter().find_map(|s| match s {
-            repair::EntryStatus::Repairable { tracks, .. } => Some(tracks),
-            _ => None,
-        })
-    });
-    for &n in damaged.into_iter().flatten() {
+    let damaged = analysis.map(repair::Analysis::plan_tracks);
+    for n in damaged.into_iter().flatten() {
         if let Some(t) = result.tracks.get_mut(n as usize - 1) {
             t.status = TrackStatus::Mismatch;
         }
@@ -1691,6 +1694,10 @@ mod tests {
         assert!(unchecked_weak_ctdb(&a, &opts(1)));
         a.reason = format!("{CTDB_MATCH}1, offset +0); {AR_CONFIRMS}");
         assert!(!unchecked_weak_ctdb(&a, &opts(1)));
+        a.reason = format!("{CTDB_MATCH}1, offset +0); {AR_CANNOT_CONFIRM}: Not in AccurateRip");
+        assert!(!unchecked_weak_ctdb(&a, &opts(1)));
+        a.reason = format!("{CTDB_MATCH}1, offset +0); {AR_CANNOT_CONFIRM}: {AR_LOOKUP_FAILED}: x");
+        assert!(unchecked_weak_ctdb(&a, &opts(1)));
         a.reason = format!("{CTDB_MATCH}2, offset +0)");
         assert!(!unchecked_weak_ctdb(&a, &opts(1)));
         assert!(unchecked_weak_ctdb(&a, &opts(3)));
@@ -1722,6 +1729,10 @@ mod tests {
         };
         assert!(cached_valid(std::slice::from_ref(&a), &no_ctdb));
         a.without_ctdb = false;
+        a.ar_unknown = true;
+        assert!(cached_valid(std::slice::from_ref(&a), &opts));
+        assert!(!cached_valid(std::slice::from_ref(&a), &no_ctdb));
+        a.ar_unknown = false;
         a.offset_range = Some(100);
         assert!(!cached_valid(std::slice::from_ref(&a), &opts));
         a.offset_range = Some(2939);

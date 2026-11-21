@@ -101,6 +101,8 @@ fn main() -> Result<std::process::ExitCode> {
     if !cli.dir.is_dir() {
         anyhow::bail!("{} is not a folder", cli.dir.display());
     }
+    // Before the scan, not after it.
+    report::summary_path(&cli.report)?;
     let ctdb_first = !cli.no_ctdb && !cli.ar_first;
     let opts = Options {
         min_confidence: cli.min_confidence,
@@ -458,6 +460,21 @@ fn start(
     });
 }
 
+/// Whether `out` (the --repair folder) holds a repaired copy of one of the
+/// album's files.
+fn has_repaired_copy(
+    album: &verify::AlbumResult,
+    out: &std::path::Path,
+    root: &std::path::Path,
+) -> bool {
+    let dest = repair::destination(out, root, &album.dir);
+    album
+        .tracks
+        .iter()
+        .filter_map(|t| t.path.file_name())
+        .any(|name| dest.join(name).is_file())
+}
+
 /// Checks one folder, or takes its results from `prior`, and returns its
 /// `Done` event.
 #[expect(
@@ -488,11 +505,15 @@ fn check_folder(
             false => (c.get(dir, s)?, opts),
         };
         // A repairable album gets its repaired copy written when --repair
-        // is given.
-        let unrepaired = ro.out.is_some()
-            && albums
-                .iter()
-                .any(|a| a.repair_outcome == Some(repair::Outcome::Repairable));
+        // is given, as does a repaired one whose copy isn't in that folder
+        // (another --repair folder, or one since deleted).
+        let unrepaired = ro.out.as_ref().is_some_and(|out| {
+            albums.iter().any(|a| match a.repair_outcome {
+                Some(repair::Outcome::Repairable) => true,
+                Some(repair::Outcome::Repaired) => !has_repaired_copy(a, out, root),
+                _ => false,
+            })
+        });
         (verify::cached_valid(&albums, o) && !unrepaired).then_some(albums)
     };
     // This mode's cached results are enough. The other mode is only filled

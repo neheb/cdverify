@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::verify::{AlbumResult, TrackStatus, Verdict};
 
@@ -14,7 +14,7 @@ pub fn write(path: &Path, albums: &[AlbumResult]) -> Result<(PathBuf, PathBuf)> 
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
     }
-    let txt = path.with_extension("txt");
+    let txt = summary_path(path)?;
     // Both are written in full before either replaces an older report.
     let json_tmp = tmp_path(path);
     let txt_tmp = tmp_path(&txt);
@@ -28,6 +28,20 @@ pub fn write(path: &Path, albums: &[AlbumResult]) -> Result<(PathBuf, PathBuf)> 
     }
     written?;
     Ok((path.to_path_buf(), txt))
+}
+
+/// Where the text summary of a report at `path` goes: `path` with a `.txt`
+/// extension. A `path` that is already that is refused, so neither file
+/// overwrites the other.
+pub fn summary_path(path: &Path) -> Result<PathBuf> {
+    let txt = path.with_extension("txt");
+    if txt == path {
+        bail!(
+            "the report {} can't end in .txt: its text summary goes there",
+            path.display()
+        );
+    }
+    Ok(txt)
 }
 
 /// `<path>.<pid>.tmp`, next to `path`.
@@ -92,4 +106,19 @@ pub fn text(albums: &[AlbumResult]) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_beside_report() {
+        assert_eq!(
+            summary_path(Path::new("a/r.json")).unwrap(),
+            Path::new("a/r.txt")
+        );
+        assert_eq!(summary_path(Path::new("r")).unwrap(), Path::new("r.txt"));
+        assert!(summary_path(Path::new("r.txt")).is_err());
+    }
 }

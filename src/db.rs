@@ -262,7 +262,8 @@ fn layouts_from_entries(entries: &[CtdbEntry], offsets: &[u32], audio_end: u32) 
     for e in entries {
         if let Some(layout) = layout_from_toc(&e.toc, offsets, audio_end) {
             match found.iter_mut().find(|f| f.0 == layout) {
-                Some(f) => f.1 += e.confidence,
+                // Confidences come unchecked off the network.
+                Some(f) => f.1 = f.1.saturating_add(e.confidence),
                 None => found.push((layout, e.confidence)),
             }
         }
@@ -333,7 +334,9 @@ pub fn ctdb_repair_info(db: &Db, toc: &str) -> Result<Option<(u32, bool)>> {
         .collect();
     Ok((!entries.is_empty()).then(|| {
         (
-            entries.iter().map(|e| e.confidence).sum(),
+            entries
+                .iter()
+                .fold(0u32, |sum, e| sum.saturating_add(e.confidence)),
             entries.iter().any(|e| e.has_parity),
         )
     }))

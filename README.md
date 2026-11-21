@@ -102,7 +102,7 @@ sizes and modification times. Only final results are cached:
 - Ripping errors, with their CTDB repair verdict.
 - Cannot Check albums for permanent reasons: lossy, not CD quality, or incomplete.
 
-Not Found albums, corrupted tracks and failed lookups (AccurateRip or CTDB) are checked again on every run. The database gains submissions over time, and a corruption seen over a network share may be a temporary read error. A cached result is also re-checked when an Accurate track no longer meets `--min-confidence`, when it came from a tag and `--no-tag` is given, when `--offset-range` changed, or when it was made with `--no-ctdb` and CTDB is now in use.
+Not Found albums, corrupted tracks and failed lookups (AccurateRip or CTDB) are checked again on every run. The database gains submissions over time, and a corruption seen over a network share may be a temporary read error. A cached result is also re-checked when an Accurate track no longer meets `--min-confidence`, when it came from a tag and `--no-tag` is given, when `--offset-range` changed, when it was made with `--no-ctdb` and CTDB is now in use, when CTDB decided an album AccurateRip doesn't know and `--no-ctdb` is now given, or when a repaired copy isn't in the current `--repair` folder.
 
 ## Limitations
 

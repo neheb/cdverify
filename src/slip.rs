@@ -417,7 +417,8 @@ fn attempt(
     };
     let splice = Splice { at, head, tail };
 
-    let mut pass = repair::Pass::new(job, toc, db)?;
+    // The stride `locate` searched: other entries' columns differ.
+    let mut pass = repair::Pass::with_stride(job, toc, db, Some(stride_frames))?;
     let mut spliced = Spliced::new(splice, total);
     let notes = decode::decode_album(&job.tracks, false, |pos, frames| {
         spliced.push(frames, &mut |f| pass.push(f));

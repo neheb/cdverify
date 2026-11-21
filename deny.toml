@@ -39,7 +39,7 @@ allow = [
 ]
 
 [bans]
-# Duplicates come from upstream (flacenc's digest 0.10, ratatui's two syns)
+# Duplicates come from upstream (ratatui's two syns)
 # and cost size, not safety.
 multiple-versions = "allow"
 wildcards = "deny"

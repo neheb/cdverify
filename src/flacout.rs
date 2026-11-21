@@ -140,12 +140,12 @@ fn check_decodes_to(path: &Path, pcm: &[i16]) -> Result<()> {
     Ok(())
 }
 
-/// Encodes with the reference `flac` binary when available, else flacenc.
+/// Encodes with the reference `flac` binary when available, else flac-codec.
 /// `out` is where the result goes; flac's work file is put next to it.
 fn encode_flac(pcm: &[i16], out: &Path) -> Result<(Vec<u8>, &'static str)> {
     match encode_with_flac_binary(pcm, out) {
         Ok(bytes) => Ok((bytes, "flac")),
-        Err(_) => Ok((encode_with_flacenc(pcm)?, "flacenc")),
+        Err(_) => Ok((encode_with_flac_codec(pcm)?, "flac-codec")),
     }
 }
 
@@ -197,63 +197,24 @@ fn encode_with_flac_binary(pcm: &[i16], out: &Path) -> Result<Vec<u8>> {
     Ok(std::fs::read(&tmp.path)?)
 }
 
-/// Interleaved 16-bit stereo as a flacenc source, converted a block at a
-/// time instead of copied whole.
-struct PcmSource<'a> {
-    pcm: &'a [i16],
-    pos: usize,
-}
+fn encode_with_flac_codec(pcm: &[i16]) -> Result<Vec<u8>> {
+    use flac_codec::encode::{FlacSampleWriter, Options};
 
-impl flacenc::source::Source for PcmSource<'_> {
-    fn channels(&self) -> usize {
-        2
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut writer = FlacSampleWriter::new_cdda(
+        &mut out,
+        Options::best().no_padding(),
+        Some(pcm.len() as u64),
+    )?;
+    // Converted a chunk at a time instead of copied whole.
+    let mut block = Vec::with_capacity(1 << 16);
+    for chunk in pcm.chunks(1 << 16) {
+        block.clear();
+        block.extend(chunk.iter().map(|&s| i32::from(s)));
+        writer.write(&block)?;
     }
-    fn bits_per_sample(&self) -> usize {
-        16
-    }
-    fn sample_rate(&self) -> usize {
-        44100
-    }
-    fn read_samples<F: flacenc::source::Fill>(
-        &mut self,
-        block_size: usize,
-        dest: &mut F,
-    ) -> Result<usize, flacenc::error::SourceError> {
-        let end = (self.pos + block_size * 2).min(self.pcm.len());
-        let block: Vec<i32> = self.pcm[self.pos..end].iter().map(|&s| s as i32).collect();
-        dest.fill_interleaved(&block)?;
-        self.pos = end;
-        Ok(block.len() / 2)
-    }
-    fn len_hint(&self) -> Option<usize> {
-        Some(self.pcm.len() / 2)
-    }
-}
-
-fn encode_with_flacenc(pcm: &[i16]) -> Result<Vec<u8>> {
-    use flacenc::component::BitRepr;
-    use flacenc::error::Verify;
-
-    let source = PcmSource { pcm, pos: 0 };
-    let config = flacenc::config::Encoder::default()
-        .into_verified()
-        .map_err(|e| anyhow!("flacenc config: {e:?}"))?;
-    // flacenc 0.5.1 writes a final frame shorter than the block size in a way
-    // other decoders reject, so pick a block size that divides the track.
-    // Tracks are whole CD sectors (588 frames); use up to 7 sectors (4116).
-    let frames = pcm.len() / 2;
-    let block_size = (1..=7)
-        .rev()
-        .map(|k| k * 588)
-        .find(|b| frames.is_multiple_of(*b))
-        .ok_or_else(|| anyhow!("track is not whole CD sectors"))?;
-    let stream = flacenc::encode_with_fixed_block_size(&config, source, block_size)
-        .map_err(|e| anyhow!("flacenc: {e:?}"))?;
-    let mut sink = flacenc::bitsink::ByteSink::new();
-    stream
-        .write(&mut sink)
-        .map_err(|e| anyhow!("flacenc write: {e:?}"))?;
-    Ok(sink.into_inner())
+    writer.finalize()?;
+    Ok(out.into_inner())
 }
 
 struct Block<'a> {
@@ -414,12 +375,12 @@ mod tests {
     fn encoders_round_trip() {
         let dir = std::env::temp_dir().join(format!("artui-flac-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // 75 sectors and a bit, with a last block shorter than flacenc's default.
+        // 75 sectors: the last block is shorter than the encoders' 4096.
         let pcm: Vec<i16> = (0..588 * 75 * 2)
             .map(|i| ((i * 37) % 2000) as i16 - 1000)
             .collect();
         for (name, bytes) in [
-            ("flacenc.flac", encode_with_flacenc(&pcm).unwrap()),
+            ("flac-codec.flac", encode_with_flac_codec(&pcm).unwrap()),
             (
                 "binary.flac",
                 encode_with_flac_binary(&pcm, &dir.join("binary.flac")).unwrap_or_default(),

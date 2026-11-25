@@ -15,7 +15,7 @@ use crate::decode;
 use crate::disc::{self, DiscId, SECTOR_FRAMES};
 use crate::repair::{self, Outcome};
 use crate::scan::AlbumJob;
-use crate::slip::Slip;
+use crate::slip::{Slip, Twice};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -161,7 +161,7 @@ pub struct AlbumResult {
     /// Explanation of a ripping error, e.g. a sample slip.
     #[serde(default)]
     pub diagnosis: Option<String>,
-    /// The sample slip the diagnosis describes, if it's a single one.
+    /// The sample slip the diagnosis describes, if it can be realigned.
     #[serde(default)]
     pub slip: Option<Slip>,
     /// Checked CTDB first (the default; not `--ar-first`).
@@ -182,6 +182,11 @@ pub struct AlbumResult {
     /// cache entries and albums that weren't decoded).
     #[serde(default)]
     pub offset_range: Option<i64>,
+    /// Sample slips were diagnosed comparing offsets within pressings, and
+    /// realigned when the drive lost sync twice (`false` for older cache
+    /// entries).
+    #[serde(default)]
+    pub slips_by_pressing: bool,
 }
 
 impl AlbumResult {
@@ -269,6 +274,7 @@ fn blank_result(job: &AlbumJob) -> AlbumResult {
         without_ctdb: false,
         ar_unknown: false,
         offset_range: None,
+        slips_by_pressing: true,
         tracks: job
             .tracks
             .iter()
@@ -615,34 +621,40 @@ pub fn verify_with(
         }
     }
 
-    // Every offset each track is known to line up at: a disc can be in
-    // AccurateRip as several pressings, and a track's best match needn't be
-    // its neighbour's. A matching frame-450 checksum counts too: some
-    // entries have only that, and some submissions' full checksums are at
-    // offsets that drift from track to track.
-    let matching: Vec<Vec<i64>> = (0..n)
+    // Every offset each track is known to line up at, and in which
+    // pressing: a disc can be in AccurateRip as several pressings, and a
+    // track's best match needn't be its neighbour's. A matching frame-450
+    // checksum counts too: some entries have only that, and some
+    // submissions' full checksums are at offsets that drift from track to
+    // track.
+    let matching: Vec<Vec<(usize, i64)>> = (0..n)
         .map(|k| {
-            let ps = pressings.as_deref().map(|p| &p[..]);
-            let mut offsets: Vec<i64> = crcs
-                .iter()
-                .filter(|(_, c)| find_match(k, &c[k], ps).confidence > 0)
-                .map(|(o, _)| *o)
-                .collect();
-            let targets: Vec<u32> = ps
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|p| p.entries.get(k))
-                .map(|e| e.crc450)
-                .filter(|&c| c != 0)
-                .collect();
-            let range = windows.range();
-            for (i, c) in windows.crc450_all(k).iter().enumerate() {
-                let o = i as i64 - range;
-                if targets.contains(c) && !offsets.contains(&o) {
-                    offsets.push(o);
+            let ps = pressings.as_deref().map_or(&[][..], |p| &p[..]);
+            let mut lineup = Vec::new();
+            for (o, c) in &crcs {
+                for (i, p) in ps.iter().enumerate() {
+                    if let Some(e) = p.entries.get(k)
+                        && e.crc != 0
+                        && (e.crc == c[k].v1 || e.crc == c[k].v2)
+                    {
+                        lineup.push((i, *o));
+                    }
                 }
             }
-            offsets
+            let range = windows.range();
+            let all = windows.crc450_all(k);
+            for (i, p) in ps.iter().enumerate() {
+                let Some(e) = p.entries.get(k).filter(|e| e.crc450 != 0) else {
+                    continue;
+                };
+                for (j, &c) in all.iter().enumerate() {
+                    let at = (i, j as i64 - range);
+                    if c == e.crc450 && !lineup.contains(&at) {
+                        lineup.push(at);
+                    }
+                }
+            }
+            lineup
         })
         .collect();
 
@@ -796,6 +808,11 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
             !a.diagnosis
                 .as_deref()
                 .is_some_and(|d| d.contains("repair data can't fix"))
+        })
+        // So do those diagnosed comparing offsets of different pressings.
+        && albums.iter().all(|a| {
+            a.slips_by_pressing
+                || !a.diagnosis.as_deref().is_some_and(|d| d.starts_with("Sample slip"))
         })
         // Tracks judged at different offsets predate judging them all at one.
         && albums.iter().all(|a| {
@@ -1261,17 +1278,59 @@ fn album_offset<'a>(
     best
 }
 
-/// Where in the album a track lines up with AccurateRip at some offset: all
-/// of an accurate track, or the 588 samples at 0:06 (frame 450) of one that
+/// Where in the album a track lines up with AccurateRip: all of an
+/// accurate track, or the 588 samples at 0:06 (frame 450) of one that
 /// doesn't match as a whole.
 struct Anchor<'a> {
     k: usize,
     number: u32,
     whole: bool,
-    /// Every offset it lines up at.
-    offsets: &'a [i64],
-    /// The one it's reported at.
-    offset: i64,
+    /// Every (pressing, offset) it lines up at.
+    lineup: &'a [(usize, i64)],
+}
+
+/// How far apart two anchors line up: offsets `(from, to)` at which they
+/// line up in the same pressing (equal if they join up). Pressings differ
+/// by whole offsets, so every pressing both line up in should put them the
+/// same distance apart, but a block of AccurateRip's response can hold
+/// checksums of more than one pressing, so some say otherwise. The distance
+/// most pressings agree on wins, then no distance, then the shortest. Only
+/// if the two share no pressing is every pair of offsets compared. The
+/// offsets are given in pressing `prefer` if it has them, so that a chain
+/// of slips reads in one pressing's terms.
+fn gap(p: &Anchor, q: &Anchor, prefer: Option<usize>) -> Option<(i64, i64, Option<usize>)> {
+    // (distance, pressing, from, to) for each pair in the same pressing.
+    let mut pairs: Vec<(i64, usize, i64, i64)> = Vec::new();
+    for &(i, from) in p.lineup {
+        for &(j, to) in q.lineup {
+            if i == j {
+                pairs.push((to - from, i, from, to));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        let mut best: Option<(i64, i64)> = None;
+        let key = |(f, t): (i64, i64)| ((t - f).abs(), f.abs());
+        for &(_, from) in p.lineup {
+            for &(_, to) in q.lineup {
+                if best.is_none_or(|b| key((from, to)) < key(b)) {
+                    best = Some((from, to));
+                }
+            }
+        }
+        return best.map(|(f, t)| (f, t, None));
+    }
+    pairs.sort_unstable();
+    pairs.dedup_by_key(|&mut (d, i, _, _)| (d, i));
+    let votes = |d: i64| pairs.iter().filter(|x| x.0 == d).count();
+    let (shift, _, _, _) = *pairs
+        .iter()
+        .max_by_key(|x| (votes(x.0), x.0 == 0, std::cmp::Reverse(x.0.abs())))?;
+    pairs
+        .iter()
+        .filter(|x| x.0 == shift)
+        .min_by_key(|x| (Some(x.1) != prefer, x.2.abs()))
+        .map(|x| (x.2, x.3, Some(x.1)))
 }
 
 /// Where between two anchors, one after the other, the drive lost sync.
@@ -1302,71 +1361,90 @@ fn slip_place(p: &Anchor, q: &Anchor) -> String {
 /// different offset after it. Accurate tracks line up as a whole; a track
 /// that doesn't may still line up at 0:06, by its frame-450 checksum, which
 /// shows where in the album the offset changes (`matching[k]` being every
-/// offset track `k` lines up at, as a whole or at 0:06). As ripped that's
-/// beyond CTDB's parity; realigned it may not be (see [`crate::slip`]).
-/// Accurate tracks in a row lining up at different offsets means the drive
-/// lost sync where they meet (or in silence there), which AccurateRip can't
-/// see but CTDB can. Returns the diagnosis and, if the drive lost sync once,
-/// between two accurate tracks, the slip.
-fn sample_slip(tracks: &[TrackResult], matching: &[Vec<i64>]) -> Option<(String, Option<Slip>)> {
+/// pressing and offset track `k` lines up at, as a whole or at 0:06). As
+/// ripped that's beyond CTDB's parity; realigned it may not be (see
+/// [`crate::slip`]). Accurate tracks in a row lining up at different offsets
+/// means the drive lost sync where they meet (or in silence there), which
+/// AccurateRip can't see but CTDB can. Returns the diagnosis and the slip to
+/// realign, if the drive lost sync once between two accurate tracks, or
+/// twice around a track lining up in between at 0:06 (as a track ripped on
+/// its own at a different offset does).
+fn sample_slip(
+    tracks: &[TrackResult],
+    matching: &[Vec<(usize, i64)>],
+) -> Option<(String, Option<Slip>)> {
     let mut anchors: Vec<Anchor> = Vec::new();
     for (k, t) in tracks.iter().enumerate() {
-        let offsets = &matching[k][..];
+        let lineup = &matching[k][..];
         let whole = match t.status {
             TrackStatus::Accurate => true,
-            TrackStatus::Mismatch if !offsets.is_empty() => false,
+            TrackStatus::Mismatch => false,
             _ => continue,
         };
-        // A track that doesn't match is reported at the offset it lines up
-        // at nearest to the last anchor's.
-        let offset = match whole {
-            true => t.offset,
-            false => {
-                let near = anchors.last().map_or(t.offset, |a| a.offset);
-                *offsets.iter().min_by_key(|o| (*o - near).abs())?
-            }
-        };
+        if lineup.is_empty() {
+            continue;
+        }
         anchors.push(Anchor {
             k,
             number: t.number,
             whole,
-            offsets,
-            offset,
+            lineup,
         });
     }
 
     let mut notes = Vec::new();
-    let mut slip = None;
+    // The anchors (indices) each slip is right after.
+    let mut slips = Vec::new();
+    let mut pressing = None;
     for (i, pq) in anchors.windows(2).enumerate() {
         let [p, q] = pq else { unreachable!() };
-        if p.offsets.iter().any(|o| q.offsets.contains(o)) {
+        let Some((from, to, used)) = gap(p, q, pressing).filter(|(f, t, _)| f != t) else {
             continue;
-        }
-        let shift = q.offset - p.offset;
+        };
+        pressing = used;
+        let shift = to - from;
         notes.push(format!(
-            "{} {} samples {} ({:+} to {:+})",
+            "{} {} samples {} ({from:+} to {to:+})",
             if shift < 0 { "dropped" } else { "repeated" },
             shift.abs(),
             slip_place(p, q),
-            p.offset,
-            q.offset,
         ));
-        // The accurate tracks either side, for a realignment.
-        let before = anchors[..=i].iter().rev().find(|a| a.whole);
-        let after = anchors[i + 1..].iter().find(|a| a.whole);
-        slip = match (before, after) {
-            (Some(b), Some(a)) => Some(Slip {
-                first: b.k + 1,
-                last: a.k - 1,
-                shift: a.offset - b.offset,
-            }),
-            _ => None,
-        };
+        slips.push(i);
     }
     if notes.is_empty() {
         return None;
     }
-    let slip = slip.filter(|_| notes.len() == 1);
+    // The accurate tracks either side, and how far apart they line up.
+    let around = |first: usize, last: usize| {
+        let before = anchors[..=first].iter().rev().find(|a| a.whole)?;
+        let after = anchors[last + 1..].iter().find(|a| a.whole)?;
+        let (from, to, _) = gap(before, after, None)?;
+        Some((before, after, to - from))
+    };
+    let slip = match slips[..] {
+        [i] => around(i, i).and_then(|(b, a, shift)| {
+            (shift != 0).then_some(Slip {
+                first: b.k + 1,
+                last: a.k - 1,
+                shift,
+                twice: None,
+            })
+        }),
+        [i, j] if j == i + 1 && !anchors[j].whole => around(i, j).and_then(|(b, a, shift)| {
+            let m = &anchors[j];
+            let (from, to, _) = gap(b, m, None)?;
+            (to != from && to - from != shift).then_some(Slip {
+                first: b.k + 1,
+                last: a.k - 1,
+                shift,
+                twice: Some(Twice {
+                    track: m.k,
+                    shift: to - from,
+                }),
+            })
+        }),
+        _ => None,
+    };
     let bad: Vec<String> = tracks
         .iter()
         .filter(|t| t.status == TrackStatus::Mismatch)
@@ -1560,6 +1638,17 @@ mod tests {
         }
     }
 
+    /// Every track lining up in pressing 0 only, at its own offset if it's
+    /// accurate.
+    fn best_only(t: &[TrackResult]) -> Vec<Vec<(usize, i64)>> {
+        t.iter()
+            .map(|t| match t.status {
+                TrackStatus::Mismatch => vec![],
+                _ => vec![(0, t.offset)],
+            })
+            .collect()
+    }
+
     #[test]
     fn detects_sample_slip() {
         use TrackStatus::*;
@@ -1568,15 +1657,6 @@ mod tests {
             track(2, 0, Mismatch),
             track(3, 42, Accurate),
         ];
-        // Where each accurate track matches; the bad ones line up nowhere.
-        let best_only = |t: &[TrackResult]| {
-            t.iter()
-                .map(|t| match t.status {
-                    Mismatch => vec![],
-                    _ => vec![t.offset],
-                })
-                .collect::<Vec<_>>()
-        };
         let (d, s) = sample_slip(&slip, &best_only(&slip)).unwrap();
         assert!(d.contains("lost sync once"), "{d}");
         assert!(d.contains("re-rip track 2"), "{d}");
@@ -1585,7 +1665,8 @@ mod tests {
             Some(Slip {
                 first: 1,
                 last: 1,
-                shift: -6
+                shift: -6,
+                twice: None,
             })
         );
         // Same offset on both sides: an ordinary ripping error, maybe repairable.
@@ -1595,9 +1676,9 @@ mod tests {
             track(3, 42, Accurate),
         ];
         assert_eq!(sample_slip(&plain, &best_only(&plain)), None);
-        // Tracks 1 and 3 best match different pressings, but both match at
-        // +42 too: the rip is in one piece.
-        let both = vec![vec![48, 42], vec![], vec![42]];
+        // Tracks 1 and 3 best match different pressings, but both match
+        // pressing 1 at +42: the rip is in one piece.
+        let both = vec![vec![(0, 48), (1, 42)], vec![], vec![(1, 42)]];
         assert_eq!(sample_slip(&slip, &both), None);
         // Two accurate tracks that don't join up.
         let boundary = [
@@ -1616,7 +1697,8 @@ mod tests {
             Some(Slip {
                 first: 2,
                 last: 1,
-                shift: -6
+                shift: -6,
+                twice: None,
             })
         );
     }
@@ -1631,7 +1713,7 @@ mod tests {
             track(2, 0, Mismatch),
             track(3, 36, Accurate),
         ];
-        let matching = vec![vec![36], vec![30], vec![36]];
+        let matching = vec![vec![(0, 36)], vec![(0, 30)], vec![(0, 36)]];
         let (d, s) = sample_slip(&tracks, &matching).unwrap();
         assert!(d.contains("lost sync twice"), "{d}");
         assert!(
@@ -1642,7 +1724,38 @@ mod tests {
             d.contains("repeated 6 samples in track 2 after 0:06 (+30 to +36)"),
             "{d}"
         );
-        assert_eq!(s, None);
+        assert_eq!(
+            s,
+            Some(Slip {
+                first: 1,
+                last: 1,
+                shift: 0,
+                twice: Some(Twice {
+                    track: 1,
+                    shift: -6
+                }),
+            })
+        );
+        // Twice, not cancelling out.
+        let tracks = [
+            track(1, 36, Accurate),
+            track(2, 0, Mismatch),
+            track(3, 40, Accurate),
+        ];
+        let matching = vec![vec![(0, 36)], vec![(0, 30)], vec![(0, 40)]];
+        let (_, s) = sample_slip(&tracks, &matching).unwrap();
+        assert_eq!(
+            s,
+            Some(Slip {
+                first: 1,
+                last: 1,
+                shift: 4,
+                twice: Some(Twice {
+                    track: 1,
+                    shift: -6
+                }),
+            })
+        );
         // One slip, before 0:06 of track 2, realigns around track 2.
         let tracks = [
             track(1, 36, Accurate),
@@ -1650,7 +1763,7 @@ mod tests {
             track(3, 0, Mismatch),
             track(4, 42, Accurate),
         ];
-        let matching = vec![vec![36], vec![42], vec![], vec![42]];
+        let matching = vec![vec![(0, 36)], vec![(0, 42)], vec![], vec![(0, 42)]];
         let (d, s) = sample_slip(&tracks, &matching).unwrap();
         assert!(d.contains("lost sync once"), "{d}");
         assert!(d.contains("re-rip tracks 2, 3"), "{d}");
@@ -1659,18 +1772,66 @@ mod tests {
             Some(Slip {
                 first: 1,
                 last: 2,
-                shift: 6
+                shift: 6,
+                twice: None,
             })
         );
         // A bad track lining up with its neighbours at 0:06: no slip.
-        let matching = vec![vec![36], vec![36], vec![], vec![36]];
-        let tracks = [
-            track(1, 36, Accurate),
-            track(2, 0, Mismatch),
-            track(3, 0, Mismatch),
-            track(4, 36, Accurate),
-        ];
+        let matching = vec![vec![(0, 36)], vec![(0, 36)], vec![], vec![(0, 36)]];
         assert_eq!(sample_slip(&tracks, &matching), None);
+    }
+
+    #[test]
+    fn compares_offsets_within_pressings() {
+        use TrackStatus::*;
+        // A real disc in AccurateRip as several pressings, whose track 3 was
+        // ripped 48 samples off: at 0:06 it's 48 samples from where each
+        // pressing has it. Blocks 2 and 4 also match tracks 2 and 4 as a
+        // whole at +0, which is another pressing's offset. Comparing offsets
+        // across pressings saw slips of 31 and 831 samples, and none of 48.
+        let around = vec![
+            (2, 0),
+            (4, 0),
+            (3, -91),
+            (5, -91),
+            (0, -862),
+            (1, -862),
+            (6, -879),
+            (7, -879),
+            (1, 0),
+            (2, -91),
+            (3, -879),
+            (4, -1536),
+        ];
+        let middle = vec![(0, -814), (1, 48), (2, -43), (3, -831), (4, -1488)];
+        let tracks = [
+            track(1, 0, Accurate),
+            track(2, -862, Accurate),
+            track(3, 0, Mismatch),
+            track(4, 0, Accurate),
+        ];
+        let matching = vec![around.clone(), around.clone(), middle, around];
+        let (d, s) = sample_slip(&tracks, &matching).unwrap();
+        assert!(
+            d.contains("repeated 48 samples in the first 6 seconds of track 3 (+0 to +48)"),
+            "{d}"
+        );
+        assert!(
+            d.contains("dropped 48 samples in track 3 after 0:06 (+48 to +0)"),
+            "{d}"
+        );
+        assert_eq!(
+            s,
+            Some(Slip {
+                first: 2,
+                last: 2,
+                shift: 0,
+                twice: Some(Twice {
+                    track: 2,
+                    shift: 48
+                }),
+            })
+        );
     }
 
     #[test]
@@ -1736,6 +1897,13 @@ mod tests {
         a.offset_range = Some(100);
         assert!(!cached_valid(std::slice::from_ref(&a), &opts));
         a.offset_range = Some(2939);
+        assert!(cached_valid(std::slice::from_ref(&a), &opts));
+        // A slip diagnosed comparing offsets across pressings.
+        a.diagnosis = Some("Sample slip: the drive lost sync twice: …".into());
+        assert!(cached_valid(std::slice::from_ref(&a), &opts));
+        a.slips_by_pressing = false;
+        assert!(!cached_valid(std::slice::from_ref(&a), &opts));
+        a.diagnosis = None;
         assert!(cached_valid(std::slice::from_ref(&a), &opts));
         let mut tag = track(1, 0, TrackStatus::AccurateTag);
         tag.confidence = 1;

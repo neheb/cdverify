@@ -100,43 +100,67 @@ const MIN_VOTES: u32 = SAMPLE_FRAMES as u32 / 4;
 /// minute's work): beyond it, the stretches they may be in are too long.
 const MAX_TWICE_WORK: u64 = 4_000_000_000;
 
-/// The album realigned at frames `at[0] <= at[1]`: its frame `i` is the
-/// rip's frame `i + shift[0]` before `at[0]`, `i + shift[1]` up to `at[1]`
-/// and `i + shift[2]` from `at[1]` on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The album realigned in pieces: from frame `pieces[j].0` up to the next
+/// piece, its frame `i` is the rip's frame `i + pieces[j].1`. Frames before
+/// the first piece aren't moved. Pieces are in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Splice {
-    at: [u64; 2],
-    shift: [i64; 3],
+    pieces: Vec<(u64, i64)>,
 }
 
 impl Splice {
+    /// Realigned at frames `at[0] <= at[1]`: by `shift[0]` before `at[0]`,
+    /// `shift[1]` up to `at[1]` and `shift[2]` from `at[1]` on.
+    fn new(at: [u64; 2], shift: [i64; 3]) -> Splice {
+        Splice {
+            pieces: vec![(0, shift[0]), (at[0], shift[1]), (at[1], shift[2])],
+        }
+    }
+
+    /// Every frame moved by `shift`.
+    fn by(shift: i64) -> Splice {
+        Splice {
+            pieces: vec![(0, shift)],
+        }
+    }
+
     /// Realigned at a single slip point.
     #[cfg(test)]
     fn once(at: u64, head: i64, tail: i64) -> Splice {
-        Splice {
-            at: [at, at],
-            shift: [head, tail, tail],
-        }
+        Splice::new([at, at], [head, tail, tail])
+    }
+
+    /// How far frame `i` is moved.
+    fn shift(&self, i: u64) -> i64 {
+        let j = self.pieces.partition_point(|p| p.0 <= i);
+        j.checked_sub(1).map_or(0, |j| self.pieces[j].1)
     }
 
     /// The rip's frame that the realigned album's frame `i` comes from.
     fn source(&self, i: u64) -> i64 {
-        let piece = (i >= self.at[0]) as usize + (i >= self.at[1]) as usize;
-        i as i64 + self.shift[piece]
+        i as i64 + self.shift(i)
+    }
+
+    /// The least any frame is moved.
+    fn least(&self) -> i64 {
+        let unmoved = self.pieces.first().is_none_or(|p| p.0 > 0);
+        let least = self.pieces.iter().map(|p| p.1).min().unwrap_or(0);
+        if unmoved { least.min(0) } else { least }
     }
 
     /// The tracks (indices) it changes: those that a piece shifted by other
     /// than 0 overlaps.
     fn moved(&self, bounds: &[u64]) -> Vec<usize> {
         let total = bounds[bounds.len() - 1];
-        let pieces = [
-            (0, self.at[0], self.shift[0]),
-            (self.at[0], self.at[1], self.shift[1]),
-            (self.at[1], total, self.shift[2]),
-        ];
+        let ranges: Vec<(u64, u64, i64)> = self
+            .pieces
+            .iter()
+            .enumerate()
+            .map(|(j, &(a, s))| (a, self.pieces.get(j + 1).map_or(total, |p| p.0), s))
+            .collect();
         (0..bounds.len() - 1)
             .filter(|&k| {
-                pieces
+                ranges
                     .iter()
                     .any(|&(a, b, s)| s != 0 && a < b && a < bounds[k + 1] && bounds[k] < b)
             })
@@ -219,7 +243,7 @@ impl Spliced {
         }
         // Later frames come from no earlier than this (the pieces still to
         // come shift by no less than the least shift).
-        let least = self.splice.shift.iter().copied().min().unwrap_or(0);
+        let least = self.splice.least();
         let keep = (self.next as i64 + least).max(0) as u64;
         let drop = keep.saturating_sub(self.start).min(self.buf.len() as u64);
         self.buf.drain(..drop as usize);
@@ -229,8 +253,8 @@ impl Spliced {
 
 /// The words of the sampled columns, for the album realigned anywhere: for
 /// column `j` (word column `cols[j]`) and row `r` (stride `r + 1`), word
-/// `[j * rows + r]` of `words[s]` if the realigned album takes it from a
-/// piece shifted by the `s`-th of the shifts gathered.
+/// `[j * rows + r]` of `words[s]` in the album realigned by the `s`-th
+/// splice gathered.
 struct Samples {
     cols: Vec<usize>,
     rows: usize,
@@ -256,17 +280,17 @@ impl Samples {
     }
 }
 
-/// Decodes the album, keeping the sampled columns' words for each of
-/// `shifts`.
+/// Decodes the album, keeping the sampled columns' words for the album
+/// realigned by each of `splices`.
 fn gather(
     job: &AlbumJob,
     geo: Geometry,
-    shifts: &[i64],
+    splices: &[Splice],
     progress: &mut dyn FnMut(f32),
 ) -> Result<Samples> {
     let total = (geo.words / 2) as u64;
     let rows = geo.stridecount;
-    let ns = shifts.len();
+    let ns = splices.len();
     // Frame columns spread over the stride; both words of each.
     let frame_cols: Vec<usize> = (0..SAMPLE_FRAMES)
         .map(|k| k * geo.stride / 2 / SAMPLE_FRAMES)
@@ -276,13 +300,13 @@ fn gather(
         .flat_map(|&f| [2 * f, 2 * f + 1])
         .collect();
     // The rip's frames wanted, with where each goes: (frame, slot), slot
-    // `(k * rows + r) * ns + s` for frame column `k` and shift `s`.
+    // `(k * rows + r) * ns + s` for frame column `k` and splice `s`.
     let mut wants: Vec<(u64, usize)> = Vec::with_capacity(SAMPLE_FRAMES * rows * ns);
     for (k, &fc) in frame_cols.iter().enumerate() {
         for r in 0..rows {
-            let i = (geo.stride / 2 * (r + 1) + fc) as i64;
-            for (s, shift) in shifts.iter().enumerate() {
-                if let Ok(src) = u64::try_from(i + shift)
+            let i = (geo.stride / 2 * (r + 1) + fc) as u64;
+            for (s, splice) in splices.iter().enumerate() {
+                if let Ok(src) = u64::try_from(splice.source(i))
                     && src < total
                 {
                     wants.push((src, (k * rows + r) * ns + s));
@@ -376,21 +400,22 @@ fn candidates(geo: Geometry, (from, to): (u64, u64)) -> impl Iterator<Item = u64
     (0..=n).map(move |i| (from + i * step).min(to))
 }
 
-/// Finds the slip point in frames `region` (words from `words[0]` before
-/// it, `words[1]` after), given an entry's full syndrome: the candidate
+/// Finds the slip point in frames `region` (words from `words[h]` before
+/// it, `words[t]` after), given an entry's full syndrome: the candidate
 /// point at which the most sampled columns match CTDB's columns at one
-/// offset.
-fn locate(
+/// offset, with how many do.
+fn locate_scored(
     samples: &Samples,
+    (h, t): (usize, usize),
     geo: Geometry,
     region: (u64, u64),
     db_syn: &[u16],
     npar: usize,
-) -> Option<u64> {
+) -> Option<(u32, u64)> {
     let columns = ctdb_columns(db_syn, npar);
     let rows = samples.rows;
-    let (head, tail) = (&samples.words[0], &samples.words[1]);
-    let mut syn = samples.syndromes(geo, npar, |f| (f >= region.0) as usize);
+    let (head, tail) = (&samples.words[h], &samples.words[t]);
+    let mut syn = samples.syndromes(geo, npar, |f| if f < region.0 { h } else { t });
     let mut best: Option<(u32, u64)> = None;
     let mut votes: HashMap<usize, u32> = HashMap::new();
     let mut points = candidates(geo, region).peekable();
@@ -425,7 +450,18 @@ fn locate(
         }
     }
     best.filter(|&(score, _)| score >= MIN_VOTES)
-        .map(|(_, at)| at)
+}
+
+/// [`locate_scored`], without the score.
+fn locate(
+    samples: &Samples,
+    words: (usize, usize),
+    geo: Geometry,
+    region: (u64, u64),
+    db_syn: &[u16],
+    npar: usize,
+) -> Option<u64> {
+    locate_scored(samples, words, geo, region, db_syn, npar).map(|(_, at)| at)
 }
 
 /// Finds two slip points together: the first in frames `first`, the second
@@ -618,11 +654,14 @@ fn attempt(
         ((region.0, at), (after, region.1))
     });
 
-    let gathered: &[i64] = match twice {
-        Some(_) => &shift,
-        None => &[shift[0], shift[2]],
-    };
-    let samples = gather(job, geo, gathered, &mut |f| progress(f / 3.0))?;
+    let gathered: Vec<Splice> = match twice {
+        Some(_) => shift.to_vec(),
+        None => vec![shift[0], shift[2]],
+    }
+    .into_iter()
+    .map(Splice::by)
+    .collect();
+    let samples = gather(job, geo, &gathered, &mut |f| progress(f / 3.0))?;
     let mut at = None;
     for e in &entries {
         let Some(url) = &e.parity_url else { continue };
@@ -635,7 +674,7 @@ fn attempt(
             Some((first, second)) => {
                 locate_twice(&samples, geo, first, second, &syn, npar).map(|(p1, p2)| [p1, p2])
             }
-            None => locate(&samples, geo, region, &syn, npar).map(|p| [p, p]),
+            None => locate(&samples, (0, 1), geo, region, &syn, npar).map(|p| [p, p]),
         };
         if at.is_some() {
             break;
@@ -644,7 +683,6 @@ fn attempt(
     let Some(at) = at else {
         return not("couldn't find where the drive lost sync in CTDB's repair data");
     };
-    let found = Splice { at, shift };
     // Two slips that cancel out near a track's start and end: the track was
     // ripped on its own at a different offset, so they're exactly there.
     // The located points are only within `stride / 8` frames.
@@ -652,48 +690,34 @@ fn attempt(
     let own_offset = (twice.is_some() && shift[0] == shift[2])
         .then(|| (0..n).find(|&k| near(at[0], bounds[k]) && near(at[1], bounds[k + 1])))
         .flatten();
-    let mut tries = vec![found];
+    let mut tries = vec![at];
     if let Some(k) = own_offset {
-        tries.insert(
-            0,
-            Splice {
-                at: [bounds[k], bounds[k + 1]],
-                shift,
-            },
-        );
+        tries.insert(0, [bounds[k], bounds[k + 1]]);
     }
 
     let mut result = None;
     let mut last_why = String::new();
-    for (i, &splice) in tries.iter().enumerate() {
-        // The stride `locate` searched: other entries' columns differ.
-        let mut pass = repair::Pass::with_stride(job, toc, db, Some(stride_frames))?;
-        let mut spliced = Spliced::new(splice, total);
+    for (i, &at) in tries.iter().enumerate() {
+        let splice = Splice::new(at, shift);
         let part = |f: f32| (1.0 + (i as f32 + f) / tries.len() as f32) / 3.0;
-        let notes = decode::decode_album(&job.tracks, false, |pos, frames| {
-            spliced.push(frames, &mut |f| pass.push(f));
-            progress(part((pos + frames.len() as u64) as f32 / total as f32));
-        });
-        spliced.finish(&mut |f| pass.push(f));
-        let analysis = pass.finish(&notes, db)?;
-        if analysis.fix_plan().is_some() {
-            result = Some((splice, analysis));
+        let checked = check(job, toc, db, stride_frames, &splice, &mut |f| {
+            progress(part(f))
+        })?;
+        if repairs(&checked.analysis).is_some() {
+            result = Some((at, splice, checked));
             break;
         }
-        last_why = analysis.summary();
+        last_why = checked.analysis.summary();
     }
-    let Some((splice, analysis)) = result else {
+    let Some((at, splice, checked)) = result else {
         let why = last_why.trim_start_matches("Not repairable: ");
         return not(&format!("realigned at the slip, {why}"));
     };
-    let Some((confidence, _, fixes)) = analysis.fix_plan() else {
-        unreachable!("checked above")
-    };
 
     // What the drive did, and where.
-    let [s0, s1, s2] = splice.shift;
+    let [s0, s1, s2] = shift;
     let did = match (slip.twice, own_offset) {
-        (Some(_), Some(k)) if splice.at == [bounds[k], bounds[k + 1]] => format!(
+        (Some(_), Some(k)) if at == [bounds[k], bounds[k + 1]] => format!(
             "track {} was ripped {} samples off the rest of the disc",
             number(k),
             (s1 - s0).abs()
@@ -702,21 +726,91 @@ fn attempt(
             "the drive {} {} samples {} and {} {} samples {}",
             what(s1 - s0),
             (s1 - s0).abs(),
-            place(job, &bounds, splice.at[0]),
+            place(job, &bounds, at[0]),
             what(s2 - s1),
             (s2 - s1).abs(),
-            place(job, &bounds, splice.at[1]),
+            place(job, &bounds, at[1]),
         ),
         (None, _) => format!(
             "the drive {} {} samples {}",
             what(slip.shift),
             slip.shift.abs(),
-            place(job, &bounds, splice.at[0])
+            place(job, &bounds, at[0])
         ),
     };
-    // The moved tracks, and any others the corrections change.
-    let mut tracks = splice.moved(&bounds);
-    for t in repair::affected_tracks(&bounds, fixes) {
+    Ok(conclude(
+        job, &bounds, &splice, &checked, &did, dest, progress,
+    ))
+}
+
+/// A realigned album checked against CTDB, with the CRC32 of each track as
+/// ripped, to tell which tracks realigning changes.
+struct Checked {
+    analysis: repair::Analysis,
+    ripped: Vec<Option<u32>>,
+}
+
+/// Checks the album realigned by `splice` against CTDB's entries with parity
+/// stride `stride_frames` (the one slip points were searched with: other
+/// entries' columns differ).
+fn check(
+    job: &AlbumJob,
+    toc: &str,
+    db: &Db,
+    stride_frames: usize,
+    splice: &Splice,
+    progress: &mut dyn FnMut(f32),
+) -> Result<Checked> {
+    let bounds = repair::track_bounds(job)?;
+    let total = bounds[job.tracks.len()];
+    let mut pass = repair::Pass::with_stride(job, toc, db, Some(stride_frames))?;
+    let mut ripped = repair::TrackCrcs::new(bounds);
+    let mut spliced = Spliced::new(splice.clone(), total);
+    let notes = decode::decode_album(&job.tracks, false, |pos, frames| {
+        ripped.push(frames);
+        spliced.push(frames, &mut |f| pass.push(f));
+        progress((pos + frames.len() as u64) as f32 / total as f32);
+    });
+    spliced.finish(&mut |f| pass.push(f));
+    Ok(Checked {
+        analysis: pass.finish(&notes, db)?,
+        ripped: ripped.finish(),
+    })
+}
+
+/// The corrections that make a realigned album match CTDB, if any do, and
+/// the confidence of the entry it then matches: none if it already does.
+fn repairs(analysis: &repair::Analysis) -> Option<(u32, &[Fix])> {
+    analysis
+        .fix_plan()
+        .map(|(c, _, f)| (c, f))
+        .or_else(|| analysis.verified().map(|(c, _)| (c, &[][..])))
+}
+
+/// Sums up a realignment (what the drive `did`) that `analysis` found
+/// repairable and, with `dest`, writes the realigned, corrected tracks there.
+fn conclude(
+    job: &AlbumJob,
+    bounds: &[u64],
+    splice: &Splice,
+    checked: &Checked,
+    did: &str,
+    dest: Option<&Path>,
+    progress: &mut dyn FnMut(f32),
+) -> (Outcome, String) {
+    let analysis = &checked.analysis;
+    let Some((confidence, fixes)) = repairs(analysis) else {
+        return (Outcome::NotRepairable, analysis.summary());
+    };
+    let number = |k: usize| job.tracks[k].number.unwrap_or(k as u32 + 1);
+    // The tracks realigning changes (moving silence doesn't), and any
+    // others the corrections change.
+    let mut tracks: Vec<usize> = splice
+        .moved(bounds)
+        .into_iter()
+        .filter(|&k| analysis.track_crc(k).is_none() || analysis.track_crc(k) != checked.ripped[k])
+        .collect();
+    for t in repair::affected_tracks(bounds, fixes) {
         let t = t as usize - 1;
         if !tracks.contains(&t) {
             tracks.push(t);
@@ -728,37 +822,458 @@ fn attempt(
         .map(|&k| number(k).to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let summary = format!(
-        "Repairable: {did}; realigning track{} {list} and correcting {} samples matches CTDB \
-         (confidence {confidence})",
-        plural(tracks.len()),
-        fixes.len(),
-    );
+    let summary = match fixes.len() {
+        0 => format!(
+            "Repairable: {did}; realigning track{} {list} matches CTDB exactly \
+             (confidence {confidence})",
+            plural(tracks.len()),
+        ),
+        n => format!(
+            "Repairable: {did}; realigning track{} {list} and correcting {n} samples matches \
+             CTDB (confidence {confidence})",
+            plural(tracks.len()),
+        ),
+    };
     let Some(dest) = dest else {
-        return Ok((
+        return (
             Outcome::Repairable,
             format!("{summary}; press r to write a repaired copy"),
+        );
+    };
+    match write(job, bounds, splice, fixes, &tracks, dest, &mut |f| {
+        progress((2.0 + f) / 3.0)
+    }) {
+        Ok((files, encoder)) => (
+            Outcome::Repaired,
+            format!(
+                "{summary}. Wrote {} repaired file{} to {} ({encoder})",
+                files.len(),
+                plural(files.len()),
+                dest.display()
+            ),
+        ),
+        Err(e) => (
+            Outcome::Repairable,
+            format!("{summary}. Writing failed: {e:#}"),
+        ),
+    }
+}
+
+/// Mismatched tracks to realign one by one, as a drive that loses sync
+/// over and over leaves them: each may be shifted as a whole, or up to or
+/// from a slip point inside it, by a few samples that AccurateRip shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Realign {
+    /// The album's AccurateRip offset, in frames.
+    pub offset: i64,
+    /// The shifts to try, besides none.
+    pub shifts: Vec<i64>,
+    pub tracks: Vec<RealignTrack>,
+}
+
+/// A mismatched track (index): the shift at which its frame 450 lines up
+/// with the rest of the album, if it does, and AccurateRip's checksums for
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealignTrack {
+    pub track: usize,
+    pub at450: Option<i64>,
+    pub crcs: Vec<u32>,
+}
+
+/// A track realigned: its frames (counted as AccurateRip does, from the
+/// album's offset) before `at` shifted by `before`, the rest by `after`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrackFix {
+    track: usize,
+    before: i64,
+    at: u64,
+    after: i64,
+}
+
+/// A track's candidate realignments: `(before, after, at)`, with `at` in
+/// `at.0..=at.1`. Shifted as a whole first, then with the slip after its
+/// frame-450 window (which shows `before`) or before it (`after`).
+fn candidate_fixes(t: &RealignTrack, shifts: &[i64], len: u64) -> Vec<(i64, i64, (u64, u64))> {
+    let f450 = 450 * SECTOR_FRAMES;
+    let mut all = vec![0];
+    all.extend(shifts.iter().copied().filter(|&s| s != 0));
+    let mut out = Vec::new();
+    match t.at450 {
+        Some(a) => {
+            out.push((a, a, (0, 0)));
+            for &c in all.iter().filter(|&&c| c != a) {
+                if len > f450 + SECTOR_FRAMES {
+                    out.push((a, c, (f450 + SECTOR_FRAMES, len)));
+                }
+                out.push((c, a, (1, f450.min(len))));
+            }
+        }
+        None => {
+            for &a in &all {
+                for &c in &all {
+                    out.push((a, c, if a == c { (0, 0) } else { (1, len) }));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Finds the first of `candidates` (see [`candidate_fixes`]) at which a
+/// track's AccurateRip checksum (v1 or v2) is one of `crcs`. `frame(i, s)`
+/// is the track's frame `i` (counted from the album's offset) shifted by
+/// `s`; positions outside `mults` don't count, as for AccurateRip.
+/// Checksums are sums over frames, so each candidate's for every slip point
+/// comes from running sums: the frames before it at one shift plus those
+/// from it on at the other.
+fn search_track(
+    len: u64,
+    mults: (u64, u64),
+    frame: impl Fn(u64, i64) -> u32,
+    candidates: &[(i64, i64, (u64, u64))],
+    crcs: &[u32],
+) -> Option<(i64, u64, i64)> {
+    let mut shifts: Vec<i64> = candidates.iter().flat_map(|c| [c.0, c.1]).collect();
+    shifts.sort_unstable();
+    shifts.dedup();
+    let idx = |s: i64| shifts.binary_search(&s).unwrap_or_default();
+    let term = |i: u64, s: i64| -> (u32, u32) {
+        let m = i + 1;
+        if m < mults.0 || m > mults.1 {
+            return (0, 0);
+        }
+        let prod = frame(i, s) as u64 * m;
+        (prod as u32, (prod >> 32) as u32)
+    };
+    let add = |a: (u32, u32), b: (u32, u32)| (a.0.wrapping_add(b.0), a.1.wrapping_add(b.1));
+    // Whole-track sums for each shift.
+    let mut total = vec![(0u32, 0u32); shifts.len()];
+    for i in 0..len {
+        for (t, &s) in total.iter_mut().zip(&shifts) {
+            *t = add(*t, term(i, s));
+        }
+    }
+    let crc = |head: (u32, u32), tail: (u32, u32)| {
+        let (lo, hi) = add(head, tail);
+        [lo, lo.wrapping_add(hi)]
+    };
+    let hit = |v: [u32; 2]| v.iter().any(|c| crcs.contains(c));
+    let zero = (0, 0);
+    for &(a, _, _) in candidates.iter().filter(|c| c.0 == c.1) {
+        if hit(crc(total[idx(a)], zero)) {
+            return Some((a, 0, a));
+        }
+    }
+    let moving: Vec<_> = candidates.iter().filter(|c| c.0 != c.1).collect();
+    if moving.is_empty() {
+        return None;
+    }
+    let to = moving.iter().map(|c| c.2.1).max().unwrap_or(0);
+    // Sums of the frames before `p`, for each shift.
+    let mut before = vec![(0u32, 0u32); shifts.len()];
+    for p in 0..=to {
+        for &&(a, c, (lo, hi)) in &moving {
+            if (lo..=hi).contains(&p) {
+                let (ta, tc) = (before[idx(a)], before[idx(c)]);
+                let rest = total[idx(c)];
+                let tail = (rest.0.wrapping_sub(tc.0), rest.1.wrapping_sub(tc.1));
+                if hit(crc(ta, tail)) {
+                    return Some((a, p, c));
+                }
+            }
+        }
+        if p < len {
+            for (b, &s) in before.iter_mut().zip(&shifts) {
+                *b = add(*b, term(p, s));
+            }
+        }
+    }
+    None
+}
+
+/// The album realigned by `fixes`: track `k`'s frames from the album's
+/// offset on, `bounds[k] + offset`, shifted as each says.
+fn realigned(bounds: &[u64], offset: i64, fixes: &[TrackFix]) -> Splice {
+    let at = |b: u64, d: u64| (b as i64 + offset + d as i64).max(0) as u64;
+    let mut pieces = Vec::new();
+    let mut sorted = fixes.to_vec();
+    sorted.sort_by_key(|f| f.track);
+    for f in sorted {
+        pieces.push((at(bounds[f.track], 0), f.before));
+        pieces.push((at(bounds[f.track], f.at), f.after));
+        pieces.push((at(bounds[f.track + 1], 0), 0));
+    }
+    // A later piece at the same frame takes over.
+    pieces.sort_by_key(|p| p.0);
+    Splice { pieces }
+}
+
+/// What realigning a track did, for a message.
+fn describe(job: &AlbumJob, f: &TrackFix) -> String {
+    let number = job.tracks[f.track].number.unwrap_or(f.track as u32 + 1);
+    let secs = f.at / (SECTOR_FRAMES * 75);
+    match f.before == f.after {
+        true => format!("track {number} is {} samples off", f.after.abs()),
+        false => format!(
+            "track {number} {} {} samples at {}:{:02}",
+            what(f.after - f.before),
+            (f.after - f.before).abs(),
+            secs / 60,
+            secs % 60
+        ),
+    }
+}
+
+/// Realigns mismatched tracks one by one (see [`Realign`]): each at the
+/// shifts at which its AccurateRip checksum matches, if any do, and one
+/// more where CTDB's parity says. Checks the album realigned so against
+/// CTDB and, if it matches or is repairable and `dest` is given, writes the
+/// realigned, corrected tracks there.
+pub fn realign(
+    job: &AlbumJob,
+    toc: &str,
+    db: &Db,
+    plan: &Realign,
+    dest: Option<&Path>,
+    progress: &mut dyn FnMut(f32),
+) -> (Outcome, String) {
+    realign_attempt(job, toc, db, plan, dest, progress).unwrap_or_else(|e| repair::failed(&e))
+}
+
+fn realign_attempt(
+    job: &AlbumJob,
+    toc: &str,
+    db: &Db,
+    plan: &Realign,
+    dest: Option<&Path>,
+    progress: &mut dyn FnMut(f32),
+) -> Result<(Outcome, String)> {
+    let n = job.tracks.len();
+    if plan.tracks.is_empty() || plan.tracks.iter().any(|t| t.track >= n) {
+        bail!("no tracks to realign");
+    }
+    let bounds = repair::track_bounds(job)?;
+    let total = bounds[n];
+    let number = |k: usize| job.tracks[k].number.unwrap_or(k as u32 + 1);
+    let rerip = |ks: &[usize]| {
+        format!(
+            "re-rip track{} {}",
+            plural(ks.len()),
+            ks.iter()
+                .map(|&k| number(k).to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let all: Vec<usize> = plan.tracks.iter().map(|t| t.track).collect();
+    let mut entries: Vec<_> = db::ctdb_exact(db, toc)
+        .context("CTDB lookup")?
+        .into_iter()
+        .filter(|e| e.parity_url.is_some() && e.crc32.is_some())
+        .collect();
+    entries.sort_by_key(|e| std::cmp::Reverse(e.confidence));
+    let Some(stride_frames) = entries.first().map(repair::entry_stride) else {
+        return Ok((
+            Outcome::NotRepairable,
+            format!(
+                "Not repairable: CTDB has no repair data for this disc; {}",
+                rerip(&all)
+            ),
         ));
     };
-    Ok(
-        match write(job, &bounds, splice, fixes, &tracks, dest, &mut |f| {
-            progress((2.0 + f) / 3.0)
-        }) {
-            Ok((files, encoder)) => (
-                Outcome::Repaired,
+    entries.retain(|e| repair::entry_stride(e) == stride_frames);
+
+    // 1. Each track's own slip, by its AccurateRip checksum. The tracks'
+    // frames at every shift tried, gathered in one decode.
+    let reach = plan.shifts.iter().map(|s| s.abs()).max().unwrap_or(0)
+        + plan
+            .tracks
+            .iter()
+            .filter_map(|t| t.at450)
+            .map(i64::abs)
+            .max()
+            .unwrap_or(0);
+    let windows: Vec<(i64, i64)> = plan
+        .tracks
+        .iter()
+        .map(|t| {
+            let start = bounds[t.track] as i64 + plan.offset - reach;
+            (start, bounds[t.track + 1] as i64 + plan.offset + reach)
+        })
+        .collect();
+    let mut bufs: Vec<Option<Vec<u32>>> = vec![None; plan.tracks.len()];
+    let mut found: Vec<Option<TrackFix>> = vec![None; plan.tracks.len()];
+    let search = |j: usize, buf: &[u32]| -> Option<TrackFix> {
+        let t = &plan.tracks[j];
+        let k = t.track;
+        let len = bounds[k + 1] - bounds[k];
+        let mults = (
+            if k == 0 { crate::crc::SKIP_FRAMES } else { 1 },
+            if k == n - 1 {
+                len.saturating_sub(crate::crc::SKIP_FRAMES)
+            } else {
+                len
+            },
+        );
+        let frame = |i: u64, s: i64| buf[(i as i64 + reach + s) as usize];
+        let candidates = candidate_fixes(t, &plan.shifts, len);
+        search_track(len, mults, frame, &candidates, &t.crcs).map(|(before, at, after)| TrackFix {
+            track: k,
+            before,
+            at,
+            after,
+        })
+    };
+    let notes = decode::decode_album(&job.tracks, false, |pos, frames| {
+        let (p0, p1) = (pos as i64, (pos + frames.len() as u64) as i64);
+        for (j, &(w0, w1)) in windows.iter().enumerate() {
+            if p1 <= w0.max(0) || p0 >= w1 || found[j].is_some() {
+                continue;
+            }
+            let buf = bufs[j].get_or_insert_with(|| vec![0; (w1 - w0) as usize]);
+            let (a, b) = (p0.max(w0), p1.min(w1));
+            if a < b {
+                buf[(a - w0) as usize..(b - w0) as usize]
+                    .copy_from_slice(&frames[(a - p0) as usize..(b - p0) as usize]);
+            }
+            // The track's window is complete (or the album ends in it).
+            if p1 >= w1.min(total as i64)
+                && let Some(buf) = bufs[j].take()
+            {
+                found[j] = search(j, &buf);
+            }
+        }
+        progress((p1 as f32 / total as f32) / 3.0);
+    });
+    check_notes(&notes)?;
+    let mut fixes: Vec<TrackFix> = found.iter().flatten().copied().collect();
+    let left: Vec<usize> = (0..plan.tracks.len())
+        .filter(|&j| found[j].is_none())
+        .collect();
+
+    // 2. One track left: where CTDB's parity says, the rest realigned.
+    let geo = Geometry::new(total, stride_frames * 2);
+    if geo.stridecount == 0 {
+        bail!("the disc is too short for its repair data");
+    }
+    let mut tries: Vec<Vec<TrackFix>> = Vec::new();
+    match left[..] {
+        [] => tries.push(fixes.clone()),
+        [j] => {
+            let t = &plan.tracks[j];
+            let k = t.track;
+            let len = bounds[k + 1] - bounds[k];
+            let candidates = candidate_fixes(t, &plan.shifts, len);
+            // The album realigned but for track `k`, which is shifted as a
+            // whole by each shift tried.
+            let mut shifts: Vec<i64> = candidates.iter().flat_map(|c| [c.0, c.1]).collect();
+            shifts.sort_unstable();
+            shifts.dedup();
+            let splices: Vec<Splice> = shifts
+                .iter()
+                .map(|&s| {
+                    let mut with = fixes.clone();
+                    with.push(TrackFix {
+                        track: k,
+                        before: s,
+                        at: 0,
+                        after: s,
+                    });
+                    realigned(&bounds, plan.offset, &with)
+                })
+                .collect();
+            let samples = gather(job, geo, &splices, &mut |f| progress((1.0 + f) / 3.0))?;
+            let idx = |s: i64| shifts.binary_search(&s).unwrap_or_default();
+            let start = (bounds[k] as i64 + plan.offset).max(0) as u64;
+            let mut scored: Vec<(u32, TrackFix)> = Vec::new();
+            for e in &entries {
+                let Some(url) = &e.parity_url else { continue };
+                let npar = repair::entry_npar(e);
+                let bytes = db::fetch(db, url).context("downloading CTDB parity")?;
+                let Some(syn) = parity::bytes_to_syndrome(geo.stride, npar, &bytes) else {
+                    continue;
+                };
+                for &(before, after, (lo, hi)) in &candidates {
+                    let fix = |at| TrackFix {
+                        track: k,
+                        before,
+                        at,
+                        after,
+                    };
+                    if before == after {
+                        scored.push((0, fix(0)));
+                        continue;
+                    }
+                    let region = (start + lo, (start + hi).min(total));
+                    if let Some((score, at)) =
+                        locate_scored(&samples, (idx(before), idx(after)), geo, region, &syn, npar)
+                    {
+                        scored.push((score, fix(at - start)));
+                    }
+                }
+                if scored.iter().any(|s| s.0 > 0) {
+                    break;
+                }
+            }
+            // The best located slips, then the track shifted as a whole.
+            scored.sort_by_key(|s| std::cmp::Reverse(s.0));
+            for (_, f) in scored.into_iter().take(3) {
+                let mut with = fixes.clone();
+                with.push(f);
+                tries.push(with);
+            }
+        }
+        _ => {
+            let ks: Vec<usize> = left.iter().map(|&j| plan.tracks[j].track).collect();
+            return Ok((
+                Outcome::NotRepairable,
                 format!(
-                    "{summary}. Wrote {} repaired file{} to {} ({encoder})",
-                    files.len(),
-                    plural(files.len()),
-                    dest.display()
+                    "Not repairable: AccurateRip finds no slip in track{} {} to realign; {}",
+                    plural(ks.len()),
+                    ks.iter()
+                        .map(|&k| number(k).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    rerip(&ks)
                 ),
-            ),
-            Err(e) => (
-                Outcome::Repairable,
-                format!("{summary}. Writing failed: {e:#}"),
-            ),
-        },
-    )
+            ));
+        }
+    }
+
+    // 3. The album realigned so, against CTDB.
+    let mut last_why = String::from("no slip found in CTDB's repair data");
+    for (i, with) in tries.iter().enumerate() {
+        let splice = realigned(&bounds, plan.offset, with);
+        let part = |f: f32| (1.0 + (i as f32 + f) / tries.len() as f32) / 3.0;
+        let checked = check(job, toc, db, stride_frames, &splice, &mut |f| {
+            progress(part(f))
+        })?;
+        if repairs(&checked.analysis).is_some() {
+            fixes = with.clone();
+            fixes.sort_by_key(|f| f.track);
+            let did = fixes
+                .iter()
+                .map(|f| describe(job, f))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(conclude(
+                job, &bounds, &splice, &checked, &did, dest, progress,
+            ));
+        }
+        last_why = checked
+            .analysis
+            .summary()
+            .trim_start_matches("Not repairable: ")
+            .to_string();
+    }
+    Ok((
+        Outcome::NotRepairable,
+        format!(
+            "Not repairable: realigned track by track, {last_why}; {}",
+            rerip(&all)
+        ),
+    ))
 }
 
 fn plural(n: usize) -> &'static str {
@@ -771,7 +1286,7 @@ fn plural(n: usize) -> &'static str {
 fn write(
     job: &AlbumJob,
     bounds: &[u64],
-    splice: Splice,
+    splice: &Splice,
     fixes: &[Fix],
     tracks: &[usize],
     out_dir: &Path,
@@ -831,7 +1346,7 @@ fn write(
             failure = Some(e);
         }
     };
-    let mut spliced = Spliced::new(splice, total);
+    let mut spliced = Spliced::new(splice.clone(), total);
     let notes = decode::decode_album(&job.tracks, false, |_, frames| {
         spliced.push(frames, &mut sink);
     });
@@ -924,14 +1439,7 @@ mod tests {
             assert_eq!(&s[6..20], &rip[..14]);
             assert_eq!(&s[20..], &rip[20..]);
             // Frames 10..30 moved 4 later.
-            let s = splice_all(
-                &rip,
-                Splice {
-                    at: [10, 30],
-                    shift: [0, 4, 0],
-                },
-                chunk,
-            );
+            let s = splice_all(&rip, Splice::new([10, 30], [0, 4, 0]), chunk);
             assert_eq!(&s[..10], &rip[..10]);
             assert_eq!(&s[10..30], &rip[14..34]);
             assert_eq!(&s[30..], &rip[30..]);
@@ -1008,7 +1516,7 @@ mod tests {
             enc.push(&truth);
             let db_syn = enc.syndrome(npar, stride, 0);
             let s = samples(&rip, geo, &[0, shift]);
-            let found = locate(&s, geo, (4000, 12000), &db_syn, npar).expect("found");
+            let found = locate(&s, (0, 1), geo, (4000, 12000), &db_syn, npar).expect("found");
             assert!(
                 found.abs_diff(slip as u64) <= stride as u64 / 4,
                 "slip {slip} shift {shift}: found {found}"
@@ -1070,10 +1578,7 @@ mod tests {
                 geo,
                 &db_syn,
                 npar,
-                Splice {
-                    at: [f1, f2],
-                    shift,
-                },
+                Splice::new([f1, f2], shift),
             );
         }
     }
@@ -1128,11 +1633,123 @@ mod tests {
     #[test]
     fn finds_moved_tracks() {
         let bounds = [0, 100, 200, 300, 400];
-        let splice = |at, shift| Splice { at, shift };
+        let splice = Splice::new;
         assert_eq!(splice([150, 150], [0, 6, 6]).moved(&bounds), vec![1, 2, 3]);
         assert_eq!(splice([150, 150], [-6, 0, 0]).moved(&bounds), vec![0, 1]);
         assert_eq!(splice([200, 200], [0, 6, 6]).moved(&bounds), vec![2, 3]);
         assert_eq!(splice([100, 200], [0, 48, 0]).moved(&bounds), vec![1]);
         assert_eq!(splice([150, 250], [0, 48, 0]).moved(&bounds), vec![1, 2]);
+    }
+
+    /// AccurateRip's v1 and v2 checksums of `track`, all positions counting.
+    fn ar_crcs(track: &[u32]) -> [u32; 2] {
+        let (mut lo, mut hi) = (0u32, 0u32);
+        for (i, &f) in track.iter().enumerate() {
+            let p = f as u64 * (i as u64 + 1);
+            lo = lo.wrapping_add(p as u32);
+            hi = hi.wrapping_add((p >> 32) as u32);
+        }
+        [lo, lo.wrapping_add(hi)]
+    }
+
+    #[test]
+    fn finds_track_slips_by_checksum() {
+        let len = 40_000u64;
+        let disc = noise(len as usize + 200, 3);
+        let truth = &disc[100..100 + len as usize];
+        let [v1, v2] = ar_crcs(truth);
+        let t = |at450| RealignTrack {
+            track: 1,
+            at450,
+            crcs: vec![v2],
+        };
+        let candidates = |at450| candidate_fixes(&t(at450), &[6, -6], len);
+        // Ripped 6 frames late from frame 30_000 on, with 6 frames
+        // repeated there: shifted back from there, it's the truth.
+        // (and the next track's first frames after it).
+        let rip: Vec<u32> = (0..len as usize + 12)
+            .map(|i| {
+                if i < 30_000 {
+                    truth[i]
+                } else {
+                    disc[100 + i - 6]
+                }
+            })
+            .collect();
+        let frame = |i: u64, s: i64| {
+            usize::try_from(i as i64 + s)
+                .ok()
+                .and_then(|j| rip.get(j))
+                .copied()
+                .unwrap_or(0)
+        };
+        let found = search_track(len, (1, len), frame, &candidates(Some(-6)), &[v2]);
+        assert_eq!(found, None, "frame 450 is unshifted here");
+        // Anywhere in the repeated frames will do.
+        let found = search_track(len, (1, len), frame, &candidates(None), &[v1]);
+        assert!(matches!(found, Some((0, 29_994..=30_000, 6))), "{found:?}");
+        // A whole track ripped 6 frames early.
+        let rip: Vec<u32> = (0..len as usize).map(|i| disc[100 + i - 6]).collect();
+        let frame = |i: u64, s: i64| rip.get((i as i64 + s) as usize).copied().unwrap_or(0);
+        let whole = search_track(len, (1, len), frame, &candidates(Some(6)), &[v2]);
+        assert_eq!(whole, None, "the last 6 frames weren't ripped");
+        let truth_crcs = ar_crcs(&truth[..len as usize - 6]);
+        let found = search_track(
+            len - 6,
+            (1, len - 6),
+            frame,
+            &candidates(Some(6)),
+            &truth_crcs,
+        );
+        assert_eq!(found, Some((6, 0, 6)));
+    }
+
+    #[test]
+    fn candidates_follow_frame_450() {
+        let f450 = 450 * SECTOR_FRAMES;
+        let t = RealignTrack {
+            track: 0,
+            at450: Some(6),
+            crcs: vec![],
+        };
+        let c = candidate_fixes(&t, &[6, -6], 1_000_000);
+        assert_eq!(c[0], (6, 6, (0, 0)));
+        assert!(c.contains(&(6, 0, (f450 + SECTOR_FRAMES, 1_000_000))));
+        assert!(c.contains(&(0, 6, (1, f450))));
+        assert!(c.contains(&(-6, 6, (1, f450))));
+        assert!(c.iter().all(|&(a, b, _)| a == 6 || b == 6));
+    }
+
+    #[test]
+    fn realigns_tracks_in_pieces() {
+        let bounds = [0, 1000, 2000, 3000, 4000];
+        let fixes = [
+            TrackFix {
+                track: 2,
+                before: 6,
+                at: 0,
+                after: 6,
+            },
+            TrackFix {
+                track: 0,
+                before: -6,
+                at: 400,
+                after: 0,
+            },
+            TrackFix {
+                track: 1,
+                before: 6,
+                at: 300,
+                after: 0,
+            },
+        ];
+        // Counted from the album's offset, +36.
+        let s = realigned(&bounds, 36, &fixes);
+        let at = |i| s.shift(i);
+        assert_eq!((at(0), at(35), at(36), at(435), at(436)), (0, 0, -6, -6, 0));
+        assert_eq!((at(1036), at(1335), at(1336)), (6, 6, 0));
+        assert_eq!((at(2035), at(2036), at(3035), at(3036)), (0, 6, 6, 0));
+        assert_eq!(s.moved(&bounds), vec![0, 1, 2, 3]);
+        assert_eq!(s.least(), -6);
     }
 }

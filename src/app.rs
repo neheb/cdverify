@@ -374,6 +374,7 @@ impl App {
         };
         let (dir, title) = (album.dir.clone(), album.title.clone());
         let slip = album.slip;
+        let realign = album.realign.clone();
         let distrust = match album.verdict {
             Verdict::RipErrors => r.weak_below,
             _ => 0,
@@ -413,7 +414,16 @@ impl App {
                         });
                     }
                 };
-                crate::repair::run(&job, &toc, &db, slip, Some(&dest), distrust, &mut progress)
+                crate::repair::run(
+                    &job,
+                    &toc,
+                    &db,
+                    slip,
+                    realign.as_ref(),
+                    Some(&dest),
+                    distrust,
+                    &mut progress,
+                )
             }))
             .unwrap_or_else(|_| {
                 (

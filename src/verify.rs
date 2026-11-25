@@ -15,7 +15,7 @@ use crate::decode;
 use crate::disc::{self, DiscId, SECTOR_FRAMES};
 use crate::repair::{self, Outcome};
 use crate::scan::AlbumJob;
-use crate::slip::{Slip, Twice};
+use crate::slip::{Realign, RealignTrack, Slip, Twice};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -182,11 +182,14 @@ pub struct AlbumResult {
     /// cache entries and albums that weren't decoded).
     #[serde(default)]
     pub offset_range: Option<i64>,
-    /// Sample slips were diagnosed comparing offsets within pressings, and
-    /// realigned when the drive lost sync twice (`false` for older cache
-    /// entries).
+    /// Mismatched tracks to realign one by one, for sample slips that
+    /// [`slip`](Self::slip) doesn't cover.
     #[serde(default)]
-    pub slips_by_pressing: bool,
+    pub realign: Option<Realign>,
+    /// How sample slips were handled (see [`SLIPS_VERSION`]; 0 for older
+    /// cache entries).
+    #[serde(default)]
+    pub slips_version: u32,
 }
 
 impl AlbumResult {
@@ -274,7 +277,8 @@ fn blank_result(job: &AlbumJob) -> AlbumResult {
         without_ctdb: false,
         ar_unknown: false,
         offset_range: None,
-        slips_by_pressing: true,
+        realign: None,
+        slips_version: SLIPS_VERSION,
         tracks: job
             .tracks
             .iter()
@@ -715,6 +719,18 @@ pub fn verify_with(
     {
         result.diagnosis = Some(diagnosis);
         result.slip = slip;
+        if result.verdict == Verdict::RipErrors
+            && !data_first
+            && let Some(p) = pressings.as_deref()
+        {
+            result.realign = realign_plan(
+                &result,
+                &per_track,
+                &matching,
+                p,
+                opts.min_confidence.max(1),
+            );
+        }
     }
     let toc = db::ctdb_toc(
         &disc::audio_offsets(&sectors),
@@ -746,6 +762,10 @@ pub fn verify_with(
 }
 
 const CTDB_LOOKUP_FAILED: &str = "CTDB lookup failed";
+/// Version of the sample slip handling: 1 compared offsets within
+/// pressings, 2 realigns tracks one by one. Older results with a slip are
+/// checked again.
+const SLIPS_VERSION: u32 = 2;
 pub const AR_LOOKUP_FAILED: &str = "AccurateRip lookup failed";
 /// Note on an album AccurateRip finds errors in, but that matches a CTDB
 /// entry too weak to trust (followed by its confidence).
@@ -809,9 +829,9 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
                 .as_deref()
                 .is_some_and(|d| d.contains("repair data can't fix"))
         })
-        // So do those diagnosed comparing offsets of different pressings.
+        // So do those diagnosed or realigned by older versions.
         && albums.iter().all(|a| {
-            a.slips_by_pressing
+            a.slips_version >= SLIPS_VERSION
                 || !a.diagnosis.as_deref().is_some_and(|d| d.starts_with("Sample slip"))
         })
         // Tracks judged at different offsets predate judging them all at one.
@@ -960,6 +980,15 @@ pub fn verify_ctdb_first(
                 progress(Stage::Realign, f)
             });
         }
+        (outcome, msg) = repair::with_realign(
+            (outcome, msg),
+            job,
+            &toc,
+            db,
+            ar.realign.as_ref(),
+            dest,
+            &mut |f| progress(Stage::Realign, f),
+        );
         ar.ctdb_known = outcome != Outcome::Failed;
         ar.ctdb_toc = Some(toc);
         ar.repair_outcome = Some(outcome);
@@ -1010,13 +1039,38 @@ pub fn verify_ctdb_first(
             ar.ctdb_known = true;
             ar.ctdb_toc = Some(toc);
             // So a more confident entry can be repaired to.
-            let (outcome, msg) = match analysis.as_mut() {
+            let (mut outcome, mut msg) = match analysis.as_mut() {
                 Ok(a) if ar.verdict == Verdict::RipErrors => {
                     a.distrust_below(weak_ctdb_below(opts));
                     repair::finish(job, a, dest)
                 }
                 _ => (Outcome::Verified, String::new()),
             };
+            // Slipped, the rip may still be repairable to a confident entry
+            // once realigned.
+            if ar.verdict == Verdict::RipErrors
+                && matches!(outcome, Outcome::Verified | Outcome::NotRepairable)
+            {
+                let toc = ar.ctdb_toc.clone().unwrap_or_default();
+                let mut realigned = match ar.slip {
+                    Some(slip) => crate::slip::run(job, &toc, db, slip, dest, &mut |f| {
+                        progress(Stage::Realign, f)
+                    }),
+                    None => (Outcome::NotRepairable, String::new()),
+                };
+                realigned = repair::with_realign(
+                    realigned,
+                    job,
+                    &toc,
+                    db,
+                    ar.realign.as_ref(),
+                    dest,
+                    &mut |f| progress(Stage::Realign, f),
+                );
+                if matches!(realigned.0, Outcome::Repairable | Outcome::Repaired) {
+                    (outcome, msg) = realigned;
+                }
+            }
             let msg = match outcome {
                 Outcome::Verified => format!(
                     "Matches a CTDB entry with confidence {confidence} exactly, but \
@@ -1356,24 +1410,10 @@ fn slip_place(p: &Anchor, q: &Anchor) -> String {
     }
 }
 
-/// A drive that loses sync drops or repeats samples, shifting all the audio
-/// after that point: what lines up with AccurateRip before it does so at a
-/// different offset after it. Accurate tracks line up as a whole; a track
-/// that doesn't may still line up at 0:06, by its frame-450 checksum, which
-/// shows where in the album the offset changes (`matching[k]` being every
-/// pressing and offset track `k` lines up at, as a whole or at 0:06). As
-/// ripped that's beyond CTDB's parity; realigned it may not be (see
-/// [`crate::slip`]). Accurate tracks in a row lining up at different offsets
-/// means the drive lost sync where they meet (or in silence there), which
-/// AccurateRip can't see but CTDB can. Returns the diagnosis and the slip to
-/// realign, if the drive lost sync once between two accurate tracks, or
-/// twice around a track lining up in between at 0:06 (as a track ripped on
-/// its own at a different offset does).
-fn sample_slip(
-    tracks: &[TrackResult],
-    matching: &[Vec<(usize, i64)>],
-) -> Option<(String, Option<Slip>)> {
-    let mut anchors: Vec<Anchor> = Vec::new();
+/// Where the tracks line up with AccurateRip: accurate ones as a whole,
+/// mismatched ones at 0:06 if they do (see [`sample_slip`]).
+fn anchors<'a>(tracks: &[TrackResult], matching: &'a [Vec<(usize, i64)>]) -> Vec<Anchor<'a>> {
+    let mut anchors = Vec::new();
     for (k, t) in tracks.iter().enumerate() {
         let lineup = &matching[k][..];
         let whole = match t.status {
@@ -1391,6 +1431,91 @@ fn sample_slip(
             lineup,
         });
     }
+    anchors
+}
+
+/// Each mismatched track's shift at 0:06 from the nearest accurate track,
+/// if it lines up there.
+fn shifts_at_450(tracks: &[TrackResult], matching: &[Vec<(usize, i64)>]) -> Vec<Option<i64>> {
+    let anchors = anchors(tracks, matching);
+    let mut out = vec![None; tracks.len()];
+    for (i, m) in anchors.iter().enumerate().filter(|(_, a)| !a.whole) {
+        let before = anchors[..i].iter().rev().find(|a| a.whole);
+        let after = anchors[i + 1..].iter().find(|a| a.whole);
+        out[m.k] = match (before, after) {
+            (Some(b), _) => gap(b, m, None).map(|(from, to, _)| to - from),
+            (None, Some(a)) => gap(m, a, None).map(|(from, to, _)| from - to),
+            (None, None) => None,
+        };
+    }
+    out
+}
+
+/// The mismatched tracks of a rip AccurateRip sees sample slips in, to
+/// realign one by one (see [`crate::slip::realign`]), if any line up at
+/// 0:06 at a shift that suggests where to look.
+fn realign_plan(
+    result: &AlbumResult,
+    per_track: &[TrackResult],
+    matching: &[Vec<(usize, i64)>],
+    pressings: &[Pressing],
+    min_confidence: u32,
+) -> Option<Realign> {
+    let at450 = shifts_at_450(per_track, matching);
+    let mut shifts: Vec<i64> = at450
+        .iter()
+        .flatten()
+        .filter(|&&s| s != 0)
+        .flat_map(|&s| [s, -s])
+        .collect();
+    shifts.sort_by_key(|s| (s.abs(), *s));
+    shifts.dedup();
+    shifts.truncate(MAX_REALIGN_SHIFTS);
+    let tracks: Vec<RealignTrack> = result
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.status == TrackStatus::Mismatch)
+        .map(|(k, _)| RealignTrack {
+            track: k,
+            at450: at450[k],
+            crcs: pressings
+                .iter()
+                .filter_map(|p| p.entries.get(k))
+                .filter(|e| e.crc != 0 && e.confidence as u32 >= min_confidence)
+                .map(|e| e.crc)
+                .collect(),
+        })
+        .collect();
+    (!shifts.is_empty() && !tracks.is_empty()).then(|| Realign {
+        offset: result.tracks.first().map_or(0, |t| t.offset),
+        shifts,
+        tracks,
+    })
+}
+
+/// Most shifts tried when realigning tracks one by one: each costs a pass
+/// over every mismatched track.
+const MAX_REALIGN_SHIFTS: usize = 6;
+
+/// A drive that loses sync drops or repeats samples, shifting all the audio
+/// after that point: what lines up with AccurateRip before it does so at a
+/// different offset after it. Accurate tracks line up as a whole; a track
+/// that doesn't may still line up at 0:06, by its frame-450 checksum, which
+/// shows where in the album the offset changes (`matching[k]` being every
+/// pressing and offset track `k` lines up at, as a whole or at 0:06). As
+/// ripped that's beyond CTDB's parity; realigned it may not be (see
+/// [`crate::slip`]). Accurate tracks in a row lining up at different offsets
+/// means the drive lost sync where they meet (or in silence there), which
+/// AccurateRip can't see but CTDB can. Returns the diagnosis and the slip to
+/// realign, if the drive lost sync once between two accurate tracks, or
+/// twice around a track lining up in between at 0:06 (as a track ripped on
+/// its own at a different offset does).
+fn sample_slip(
+    tracks: &[TrackResult],
+    matching: &[Vec<(usize, i64)>],
+) -> Option<(String, Option<Slip>)> {
+    let anchors = anchors(tracks, matching);
 
     let mut notes = Vec::new();
     // The anchors (indices) each slip is right after.
@@ -1835,6 +1960,68 @@ mod tests {
     }
 
     #[test]
+    fn plans_realigning_tracks_one_by_one() {
+        use TrackStatus::*;
+        // Tracks 2 and 4 line up 6 samples either side of the rest at 0:06;
+        // track 5 nowhere.
+        let tracks = [
+            track(1, 36, Accurate),
+            track(2, 36, Mismatch),
+            track(3, 36, Accurate),
+            track(4, 36, Mismatch),
+            track(5, 36, Mismatch),
+        ];
+        let matching = vec![
+            vec![(0, 36)],
+            vec![(0, 30)],
+            vec![(0, 36)],
+            vec![(0, 42)],
+            vec![],
+        ];
+        assert_eq!(
+            shifts_at_450(&tracks, &matching),
+            vec![None, Some(-6), None, Some(6), None]
+        );
+        let entry = |crc| crate::db::Entry {
+            confidence: 5,
+            crc,
+            crc450: 0,
+        };
+        let pressings = [Pressing {
+            entries: (1..=5).map(entry).collect(),
+        }];
+        let job = AlbumJob {
+            dir: PathBuf::new(),
+            title: String::new(),
+            tracks: Vec::new(),
+        };
+        let mut result = blank_result(&job);
+        result.tracks = tracks.to_vec();
+        let plan = realign_plan(&result, &tracks, &matching, &pressings, 1).unwrap();
+        assert_eq!(plan.offset, 36);
+        assert_eq!(plan.shifts, vec![-6, 6]);
+        let summary: Vec<_> = plan
+            .tracks
+            .iter()
+            .map(|t| (t.track, t.at450, t.crcs.clone()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (1, Some(-6), vec![2]),
+                (3, Some(6), vec![4]),
+                (4, None, vec![5])
+            ]
+        );
+        // Too little confidence to go by.
+        let plan = realign_plan(&result, &tracks, &matching, &pressings, 6).unwrap();
+        assert!(plan.tracks.iter().all(|t| t.crcs.is_empty()));
+        // Nothing lines up anywhere else: nothing to go by.
+        let flat = vec![vec![(0, 36)], vec![(0, 36)], vec![(0, 36)], vec![], vec![]];
+        assert_eq!(realign_plan(&result, &tracks, &flat, &pressings, 1), None);
+    }
+
+    #[test]
     fn rechecks_weak_ctdb_matches() {
         let opts = |min_confidence| Options {
             min_confidence,
@@ -1901,7 +2088,7 @@ mod tests {
         // A slip diagnosed comparing offsets across pressings.
         a.diagnosis = Some("Sample slip: the drive lost sync twice: …".into());
         assert!(cached_valid(std::slice::from_ref(&a), &opts));
-        a.slips_by_pressing = false;
+        a.slips_version = 1;
         assert!(!cached_valid(std::slice::from_ref(&a), &opts));
         a.diagnosis = None;
         assert!(cached_valid(std::slice::from_ref(&a), &opts));

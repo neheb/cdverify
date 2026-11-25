@@ -195,6 +195,7 @@ fn wants_repair(album: &verify::AlbumResult, ro: &RepairOptions) -> bool {
     ro.check_all
         || (album.ctdb_known
             && (album.slip.is_some()
+                || album.realign.is_some()
                 || (album.verdict == verify::Verdict::RipErrors && album.diagnosis.is_none())))
 }
 
@@ -256,6 +257,7 @@ fn maybe_repair(
                 &toc,
                 db,
                 album.slip,
+                album.realign.as_ref(),
                 dest.as_deref(),
                 distrust,
                 &mut |f| progress(verify::Stage::Repair, f),

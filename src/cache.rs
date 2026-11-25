@@ -323,7 +323,8 @@ mod tests {
             without_ctdb: false,
             ar_unknown: false,
             offset_range: None,
-            slips_by_pressing: true,
+            realign: None,
+            slips_version: 2,
         }
     }
 

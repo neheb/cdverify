@@ -23,7 +23,7 @@ use crate::disc::SECTOR_FRAMES;
 use crate::flacout;
 use crate::parity::{self, Fix, Geometry, MAX_NPAR, ParityEncoder};
 use crate::scan::AlbumJob;
-use crate::slip::Slip;
+use crate::slip::{Realign, Slip};
 
 /// What one CTDB entry says about the rip.
 #[derive(Debug, Clone, Serialize)]
@@ -196,6 +196,11 @@ impl Analysis {
 
     /// CRC32 of the audio checked for tracks `first..last` (indices into
     /// the album's tracks), if the whole range was fed.
+    /// CRC32 of track `k`'s audio as checked.
+    pub fn track_crc(&self, k: usize) -> Option<u32> {
+        self.range_crc(k, k + 1)
+    }
+
     fn range_crc(&self, first: usize, last: usize) -> Option<u32> {
         let (a, b) = (*self.bound_crcs.get(first)?, *self.bound_crcs.get(last)?);
         let len = self.bounds[last].checked_sub(self.bounds[first])?;
@@ -210,6 +215,51 @@ impl Analysis {
         } else {
             Outcome::NotRepairable
         }
+    }
+}
+
+/// CRC32 (IEEE) of each track's audio, fed the album's frames in order.
+pub struct TrackCrcs {
+    bounds: Arc<[u64]>,
+    crc: Crc32,
+    pos: u64,
+    /// The CRC of the frames before each bound reached.
+    at: Vec<u32>,
+}
+
+impl TrackCrcs {
+    pub fn new(bounds: Arc<[u64]>) -> TrackCrcs {
+        TrackCrcs {
+            bounds,
+            crc: Crc32::new(),
+            pos: 0,
+            at: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, frames: &[u32]) {
+        for &f in frames {
+            self.mark();
+            self.crc.update_frame(f);
+            self.pos += 1;
+        }
+    }
+
+    fn mark(&mut self) {
+        while self.bounds.get(self.at.len()) == Some(&self.pos) {
+            self.at.push(self.crc.value());
+        }
+    }
+
+    /// Each track's CRC32 (`None` for any the album was too short for).
+    pub fn finish(mut self) -> Vec<Option<u32>> {
+        self.mark();
+        (0..self.bounds.len() - 1)
+            .map(|k| {
+                let (a, b) = (*self.at.get(k)?, *self.at.get(k + 1)?);
+                Some(b ^ crc32_shift(a, (self.bounds[k + 1] - self.bounds[k]) * 4))
+            })
+            .collect()
     }
 }
 
@@ -519,25 +569,63 @@ pub fn affected_tracks(bounds: &[u64], fixes: &[Fix]) -> Vec<u32> {
 /// An exact match below `distrust_below` doesn't stop a repair toward a more
 /// confident entry (see [`Analysis::distrust_below`]).
 /// With `slip`, a sample slip AccurateRip found, the album is realigned
-/// first (see [`slip`](crate::slip)).
+/// first (see [`slip`](crate::slip)); failing that, with `realign`, its
+/// mismatched tracks are realigned one by one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what AccurateRip found, passed through"
+)]
 pub fn run(
     job: &AlbumJob,
     toc: &str,
     db: &Db,
     slip: Option<Slip>,
+    realign: Option<&Realign>,
     dest: Option<&Path>,
     distrust_below: u32,
     progress: &mut dyn FnMut(f32),
 ) -> (Outcome, String) {
-    if let Some(slip) = slip {
-        return crate::slip::run(job, toc, db, slip, dest, progress);
-    }
-    match analyze(job, toc, db, progress) {
-        Ok(mut a) => {
-            a.distrust_below(distrust_below);
-            finish(job, &a, dest)
-        }
-        Err(e) => failed(&e),
+    let first = match slip {
+        Some(slip) => crate::slip::run(job, toc, db, slip, dest, progress),
+        None => match analyze(job, toc, db, progress) {
+            Ok(mut a) => {
+                a.distrust_below(distrust_below);
+                // Only an entry too weak to trust (maybe this rip's own
+                // submission) matches: realigned, it may match a better one.
+                if let Some(plan) = realign
+                    && a.verified().is_some_and(|(c, _)| c < distrust_below)
+                {
+                    let second = crate::slip::realign(job, toc, db, plan, dest, progress);
+                    if matches!(second.0, Outcome::Repairable | Outcome::Repaired) {
+                        return second;
+                    }
+                }
+                finish(job, &a, dest)
+            }
+            Err(e) => failed(&e),
+        },
+    };
+    with_realign(first, job, toc, db, realign, dest, progress)
+}
+
+/// An album found not repairable as it is (or as realigned at a single
+/// slip), retried with its mismatched tracks realigned one by one, if
+/// AccurateRip suggests how.
+pub fn with_realign(
+    first: (Outcome, String),
+    job: &AlbumJob,
+    toc: &str,
+    db: &Db,
+    realign: Option<&Realign>,
+    dest: Option<&Path>,
+    progress: &mut dyn FnMut(f32),
+) -> (Outcome, String) {
+    let Some(plan) = realign.filter(|_| first.0 == Outcome::NotRepairable) else {
+        return first;
+    };
+    match crate::slip::realign(job, toc, db, plan, dest, progress) {
+        (Outcome::Failed, _) => first,
+        second => second,
     }
 }
 

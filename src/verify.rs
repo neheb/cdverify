@@ -190,9 +190,23 @@ pub struct AlbumResult {
     /// cache entries).
     #[serde(default)]
     pub slips_version: u32,
+    /// Exact CTDB matches were weighed against the ends of the disc that
+    /// CTDB's CRC32 leaves out (false for older cache entries).
+    #[serde(default)]
+    pub ctdb_edges: bool,
 }
 
 impl AlbumResult {
+    /// The tracks AccurateRip finds don't match, as `(index, offset)`.
+    pub fn mismatched(&self) -> Vec<(usize, i64)> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.status == TrackStatus::Mismatch)
+            .map(|(k, t)| (k, t.offset))
+            .collect()
+    }
+
     pub fn musicbrainz_url(&self) -> Option<String> {
         self.mb_disc_id
             .as_ref()
@@ -279,6 +293,7 @@ fn blank_result(job: &AlbumJob) -> AlbumResult {
         offset_range: None,
         realign: None,
         slips_version: SLIPS_VERSION,
+        ctdb_edges: true,
         tracks: job
             .tracks
             .iter()
@@ -843,6 +858,7 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
                 .map(|t| t.offset);
             offsets.next().is_none_or(|o| offsets.all(|p| p == o))
         })
+        && !stale_ctdb_match(albums)
         // Weak CTDB matches accepted without asking AccurateRip.
         && albums.iter().all(|a| !unchecked_weak_ctdb(a, opts))
         // A check without CTDB skipped layout lookups and the repair check.
@@ -863,6 +879,18 @@ pub fn cached_valid(albums: &[AlbumResult], opts: &Options) -> bool {
                 }
                 _ => true,
             })
+}
+
+/// Whether an album with ripping errors was let off by an exact CTDB match
+/// before such matches were weighed against the ends of the disc that
+/// CTDB doesn't check. In --ar-first mode that's the album itself; a
+/// CTDB-first result shows it in the other mode's (`--ar-first`) results.
+pub fn stale_ctdb_match(albums: &[AlbumResult]) -> bool {
+    albums.iter().any(|a| {
+        !a.ctdb_edges
+            && a.verdict == Verdict::RipErrors
+            && a.repair_outcome == Some(Outcome::Verified)
+    })
 }
 
 /// Whether an ineligible album's `reason` blames a file that couldn't be
@@ -958,7 +986,7 @@ pub fn verify_ctdb_first(
         .and_then(|a| a.verified())
     else {
         let (mut outcome, mut msg) = match &analysis {
-            Ok(a) => repair::finish(job, a, dest),
+            Ok(a) => repair::finish(job, a, dest, &[]),
             Err(e) => repair::failed(e),
         };
         if opts.ctdb_only {
@@ -1042,7 +1070,7 @@ pub fn verify_ctdb_first(
             let (mut outcome, mut msg) = match analysis.as_mut() {
                 Ok(a) if ar.verdict == Verdict::RipErrors => {
                     a.distrust_below(weak_ctdb_below(opts));
-                    repair::finish(job, a, dest)
+                    repair::finish(job, a, dest, &[])
                 }
                 _ => (Outcome::Verified, String::new()),
             };
@@ -1091,6 +1119,26 @@ pub fn verify_ctdb_first(
         }
     }
 
+    // CTDB's CRC32 leaves out the ends of the disc, which AccurateRip checks
+    // in the first and last tracks. If every track AccurateRip finds errors
+    // in reaches into them, the match can't vouch for those tracks (a rip
+    // with its last samples zeroed matches CTDB exactly): AccurateRip has
+    // the final word.
+    if let (Some(ar), Ok(a)) = (
+        ar.filter(|a| a.verdict == Verdict::RipErrors),
+        analysis.as_ref(),
+    ) && !a.blind_tracks(&ar.mismatched()).is_empty()
+    {
+        let mut ar = accuraterip(job, db, opts, Some(ar), progress);
+        let (outcome, msg) = repair::finish(job, a, dest, &ar.mismatched());
+        ar.reason = format!("{}; {}", ar.reason, outcome.verdict_note());
+        ar.ctdb_known = true;
+        ar.ctdb_toc = Some(toc);
+        ar.repair_outcome = Some(outcome);
+        ar.repair = Some(msg.clone());
+        return (ar, Some((outcome, msg)));
+    }
+
     // An image's layout comes from its CUE sheet: `identify` covered it.
     if let Some(layout) = layout.filter(|_| image_layout(job).is_none()) {
         let (id, note) = layout_id(&sectors, layout);
@@ -1133,7 +1181,8 @@ fn ctdb_only_verdict(
             let why = msg.trim_start_matches("Repair check failed: ");
             (Verdict::CannotCheck, format!("CTDB check failed: {why}"))
         }
-        Outcome::Repairable | Outcome::Repaired | Outcome::NotRepairable => (
+        // Not without AccurateRip's mismatches, which --ctdb-only doesn't have.
+        Outcome::Repairable | Outcome::Repaired | Outcome::NotRepairable | Outcome::Blind => (
             Verdict::RipErrors,
             format!("Doesn't match CTDB; {}", outcome.verdict_note()),
         ),

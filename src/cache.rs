@@ -325,6 +325,7 @@ mod tests {
             offset_range: None,
             realign: None,
             slips_version: 2,
+            ctdb_edges: true,
         }
     }
 

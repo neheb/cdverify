@@ -260,6 +260,7 @@ fn maybe_repair(
                 album.realign.as_ref(),
                 dest.as_deref(),
                 distrust,
+                &album.mismatched(),
                 &mut |f| progress(verify::Stage::Repair, f),
             )
         });
@@ -522,7 +523,14 @@ fn check_folder(
     // in for folders that get scanned anyway: one missing from the cache
     // needs rechecking (e.g. an album AccurateRip doesn't know), which is
     // for a run in that mode.
-    if let Some(albums) = cached(false) {
+    // A CTDB-first result accepted for an exact CTDB match may need another
+    // look, which the --ar-first results cached beside it tell.
+    let stale_other = opts.ctdb_first
+        && prior
+            .zip(stamps.as_ref())
+            .and_then(|(c, s)| c.get_other(dir, s))
+            .is_some_and(|a| verify::stale_ctdb_match(&a));
+    if let Some(albums) = cached(false).filter(|_| !stale_other) {
         return Event::Done {
             worker,
             dir: dir.to_path_buf(),

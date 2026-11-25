@@ -17,6 +17,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 
+use crate::crc::SKIP_FRAMES;
 use crate::db::{self, CtdbEntry, Db};
 use crate::decode;
 use crate::disc::SECTOR_FRAMES;
@@ -32,6 +33,10 @@ pub enum EntryStatus {
     Verified {
         confidence: u32,
         offset: i64,
+        /// Frames of the rip `[a, b)` that the entry's CRC32 covers: CTDB
+        /// checks nothing outside them.
+        #[serde(skip)]
+        window: (u64, u64),
     },
     /// The rip can be corrected to match this entry.
     Repairable {
@@ -56,6 +61,10 @@ pub enum Outcome {
     Repaired,
     NotRepairable,
     Failed,
+    /// Matches a CTDB entry exactly, but AccurateRip's mismatches lie in
+    /// tracks that reach into the ends of the disc, which CTDB's CRC32
+    /// doesn't cover: CTDB can neither confirm nor repair them.
+    Blind,
 }
 
 impl Outcome {
@@ -67,6 +76,7 @@ impl Outcome {
             Outcome::Repaired => "repaired copy written",
             Outcome::NotRepairable => "not repairable with CTDB",
             Outcome::Failed => "CTDB check failed",
+            Outcome::Blind => "matches CTDB, which doesn't check the ends of the disc",
         }
     }
 
@@ -77,7 +87,9 @@ impl Outcome {
         match self {
             Outcome::Verified => Some(false),
             Outcome::Failed => Some(true),
-            Outcome::Repairable | Outcome::Repaired | Outcome::NotRepairable => None,
+            Outcome::Repairable | Outcome::Repaired | Outcome::NotRepairable | Outcome::Blind => {
+                None
+            }
         }
     }
 }
@@ -119,11 +131,7 @@ impl Analysis {
             }) => format!(
                 "Repairable: {samples} samples differ in track{} {} (CTDB confidence {confidence})",
                 if tracks.len() == 1 { "" } else { "s" },
-                tracks
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                join_numbers(tracks)
             ),
             _ => {
                 let reasons: Vec<String> = self
@@ -153,13 +161,57 @@ impl Analysis {
         self.statuses
             .iter()
             .filter_map(|s| match s {
-                EntryStatus::Verified { confidence, offset } => Some((*confidence, *offset)),
+                EntryStatus::Verified {
+                    confidence, offset, ..
+                } => Some((*confidence, *offset)),
                 _ => None,
             })
             .max_by_key(|v| v.0)
             .filter(|&(conf, _)| {
                 conf >= self.distrust_below || self.plan.as_ref().is_none_or(|p| p.0 <= conf)
             })
+    }
+
+    /// The frames `[a, b)` of the rip that the [`verified`](Self::verified)
+    /// entry's CRC32 covers.
+    fn verified_window(&self) -> Option<(u64, u64)> {
+        let (conf, offset) = self.verified()?;
+        self.statuses.iter().find_map(|s| match s {
+            EntryStatus::Verified {
+                confidence,
+                offset: o,
+                window,
+            } if *confidence == conf && *o == offset => Some(*window),
+            _ => None,
+        })
+    }
+
+    /// Of the tracks AccurateRip finds don't match (`(index, offset)`), the
+    /// numbers of those whose checked audio reaches outside the CRC32 window
+    /// of the CTDB entry the rip matches exactly. Empty if the rip matches
+    /// no entry, or if any mismatched track lies wholly within the window:
+    /// then CTDB vouches for audio AccurateRip disputes, and the match
+    /// stands as another version of the disc.
+    pub fn blind_tracks(&self, mismatched: &[(usize, i64)]) -> Vec<u32> {
+        let Some((a, b)) = self.verified_window() else {
+            return Vec::new();
+        };
+        let last = self.bounds.len().saturating_sub(2);
+        let mut blind = Vec::new();
+        for &(k, offset) in mismatched {
+            let (Some(&start), Some(&end)) = (self.bounds.get(k), self.bounds.get(k + 1)) else {
+                return Vec::new();
+            };
+            // The frames AccurateRip checks, as in `crc::OffsetAccum`.
+            let from = start + if k == 0 { SKIP_FRAMES - 1 } else { 0 };
+            let to = end.saturating_sub(if k == last { SKIP_FRAMES } else { 0 });
+            let (from, to) = (from as i64 + offset, to as i64 + offset);
+            if from >= a as i64 && to <= b as i64 {
+                return Vec::new();
+            }
+            blind.push(k as u32 + 1);
+        }
+        blind
     }
 
     /// Stops an exact match below confidence `conf` from ruling out a repair
@@ -462,6 +514,7 @@ impl Pass {
                 statuses.push(EntryStatus::Verified {
                     confidence: conf,
                     offset,
+                    window: parity::crc_window(geo, offset),
                 });
                 continue;
             }
@@ -583,6 +636,7 @@ pub fn run(
     realign: Option<&Realign>,
     dest: Option<&Path>,
     distrust_below: u32,
+    mismatched: &[(usize, i64)],
     progress: &mut dyn FnMut(f32),
 ) -> (Outcome, String) {
     let first = match slip {
@@ -600,7 +654,7 @@ pub fn run(
                         return second;
                     }
                 }
-                finish(job, &a, dest)
+                finish(job, &a, dest, mismatched)
             }
             Err(e) => failed(&e),
         },
@@ -629,13 +683,51 @@ pub fn with_realign(
     }
 }
 
+/// Track numbers as a list: "3, 12".
+fn join_numbers(tracks: &[u32]) -> String {
+    tracks
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The outcome of an [`analyze`] that failed.
 pub fn failed(e: &anyhow::Error) -> (Outcome, String) {
     (Outcome::Failed, format!("Repair check failed: {e:#}"))
 }
 
 /// The second half of [`run`]: writes repaired copies to `dest` if possible.
-pub fn finish(job: &AlbumJob, analysis: &Analysis, dest: Option<&Path>) -> (Outcome, String) {
+/// `mismatched` are the tracks AccurateRip finds don't match, as
+/// `(index, offset)`: an exact match that can't vouch for them is
+/// [`Outcome::Blind`].
+pub fn finish(
+    job: &AlbumJob,
+    analysis: &Analysis,
+    dest: Option<&Path>,
+    mismatched: &[(usize, i64)],
+) -> (Outcome, String) {
+    let blind = analysis.blind_tracks(mismatched);
+    if let (Some((conf, offset)), Some((a, b)), false) = (
+        analysis.verified(),
+        analysis.verified_window(),
+        blind.is_empty(),
+    ) {
+        let total = analysis.bounds.last().copied().unwrap_or(0);
+        return (
+            Outcome::Blind,
+            format!(
+                "Matches CTDB exactly (confidence {conf}, offset {offset:+}), but CTDB's \
+                 checksum leaves out the first {a} and last {} frames of the disc, where \
+                 AccurateRip still checks some: CTDB can't confirm track{} {}, where AccurateRip \
+                 finds errors, or repair {}",
+                total.saturating_sub(b),
+                if blind.len() == 1 { "" } else { "s" },
+                join_numbers(&blind),
+                if blind.len() == 1 { "it" } else { "them" },
+            ),
+        );
+    }
     let summary = analysis.summary();
     match (dest, analysis.outcome()) {
         (Some(dest), Outcome::Repairable) => {
@@ -917,6 +1009,46 @@ fn crc32_shift(mut crc: u32, mut len: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An analysis whose rip matches one entry exactly, with that entry's
+    /// CRC32 covering frames `window` of tracks starting at `bounds`.
+    fn verified(bounds: &[u64], window: (u64, u64)) -> Analysis {
+        Analysis {
+            statuses: vec![EntryStatus::Verified {
+                confidence: 10,
+                offset: 0,
+                window,
+            }],
+            md5_mismatch: false,
+            plan: None,
+            bounds: bounds.into(),
+            bound_crcs: Vec::new(),
+            distrust_below: 0,
+        }
+    }
+
+    #[test]
+    fn exact_matches_dont_vouch_for_the_ends_of_the_disc() {
+        // Three tracks; CTDB's CRC32 leaves out 5880 frames at the start
+        // and 8232 at the end, AccurateRip 2940 at each end.
+        let a = verified(&[0, 100_000, 200_000, 300_000], (5880, 300_000 - 8232));
+        // The last track reaches into the end CTDB doesn't check.
+        assert_eq!(a.blind_tracks(&[(2, 0)]), vec![3]);
+        assert_eq!(a.blind_tracks(&[(0, 0), (2, 0)]), vec![1, 3]);
+        // A middle track is covered: CTDB vouches for audio AccurateRip
+        // disputes, so the match stands.
+        assert!(a.blind_tracks(&[(1, 0)]).is_empty());
+        assert!(a.blind_tracks(&[(1, 0), (2, 0)]).is_empty());
+        assert!(a.blind_tracks(&[]).is_empty());
+        // A first track AccurateRip checks at an offset past CTDB's window.
+        let a = verified(&[0, 100_000, 200_000], (2000, 200_000 - 8232));
+        assert!(a.blind_tracks(&[(0, 0)]).is_empty());
+        assert_eq!(a.blind_tracks(&[(0, -1000)]), vec![1]);
+        // No exact match: nothing to weigh.
+        let mut a = a;
+        a.statuses.clear();
+        assert!(a.blind_tracks(&[(0, -1000)]).is_empty());
+    }
 
     fn crc(bytes: &[u8]) -> u32 {
         let mut c = Crc32::new();

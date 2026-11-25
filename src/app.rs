@@ -355,6 +355,14 @@ impl App {
                     Some("This rip matches CTDB exactly; there's nothing to repair".into());
                 return;
             }
+            Some(crate::repair::Outcome::Blind) => {
+                self.message = Some(
+                    "This rip matches CTDB, which doesn't check the ends of the disc where \
+                     AccurateRip finds errors; CTDB can't repair them"
+                        .into(),
+                );
+                return;
+            }
             Some(crate::repair::Outcome::Repaired) => {
                 self.message = Some(
                     "A repaired copy was already written (use --rescan to check again)".into(),
@@ -375,6 +383,7 @@ impl App {
         let (dir, title) = (album.dir.clone(), album.title.clone());
         let slip = album.slip;
         let realign = album.realign.clone();
+        let mismatched = album.mismatched();
         let distrust = match album.verdict {
             Verdict::RipErrors => r.weak_below,
             _ => 0,
@@ -422,6 +431,7 @@ impl App {
                     realign.as_ref(),
                     Some(&dest),
                     distrust,
+                    &mismatched,
                     &mut progress,
                 )
             }))
